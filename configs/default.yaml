@@ -1,47 +1,53 @@
-# Default Emotion2Skill configuration (Qwen3-8B, WebShop)
-# Override individual fields via CLI flags or a custom YAML.
-
 model:
-  name_or_path: "Qwen/Qwen3-8B"
-  key: "qwen3-8b"          # qwen3-8b | qwen3-14b
-  device: "cuda"
-
+  name_or_path: Qwen/Qwen3-8B
+  key: qwen3-8b
+  device: cuda
 extractor:
-  optimal_layer:            # null = auto-selected via GoEmotions sweep
-  stories_path: "data/emotion_stories/stories.json"
-  goemotions_test: "data/goemotions/test.json"
-  n_stories: 100
-  prefix_skip: 50
-  pca_components: 5
-  n_neutral: 200
-
+  checkpoint: checkpoints/extractor_qwen3_8b.pkl
+  mode: contrastive
+  stories_path: data/emotion_stories/stories.json
+  goemotions_validation: data/goemotions/validation.json
+  goemotions_test: data/goemotions/test.json
+  pca_components: 10
+  n_neutral: 100
 encoder:
-  d_prime: 128              # MLP output dim
-  n_templates: 12           # C = 12 emotion-state templates
-  tau: 0.3                  # confidence gate threshold
-  kappa: 0.07               # contrastive temperature
-  kappa_prime: 0.10         # classification temperature
-  lambda: 0.5               # weight of L_cls
-
+  checkpoint: checkpoints/encoder_qwen3_8b.pt
+  tau: 0.3
 training:
-  warmup_episodes: 50
-  epochs: 30
-  batch_size: 256
-  lr: 3.0e-4
+  warmup_episodes_per_env: 250
+  epochs: 50
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0001
+  patience: 5
   seed: 42
-
 evolution:
   enabled: true
-  rounds: 5
-  eta: 0.5                  # skill underperformance threshold
-  window: 20                # rolling window for success tracking
-  episode_per_round: 20
-
+  rounds: 3
+  eta: 0.4
+  window: 100
+  episode_per_round: 50
 evaluation:
-  n_episodes: 500           # WebShop test set size
+  env: webshop
+  method: Emotion2Skill
+  ablation: full
+  split: test
+  n_episodes: null
   n_runs: 3
-  max_steps: 15             # per episode (WebShop)
-
+  seed: 42
+  mock: false
+  max_steps: null
+  mbpp_timeout: 5.0
+  evaluate_each_round: false
+datasets:
+  webshop:
+    manifest: manifests/webshop.json
+  alfworld:
+    manifest: manifests/alfworld.json
+    data_path: data/alfworld
+  math:
+    manifest: manifests/math.json
+  mbpp:
+    manifest: manifests/mbpp.json
 logging:
-  log_dir: "logs"
-  results_dir: "results"
+  results_dir: results

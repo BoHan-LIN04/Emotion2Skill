@@ -1,0 +1,15 @@
+# Direct dependencies verified with Python 3.11 on macOS arm64.
+# This CPU regression environment is distinct from the original GPU experiments.
+torch==2.14.1
+transformers==4.57.6
+accelerate==1.15.0
+numpy==2.4.6
+scipy==1.17.1
+scikit-learn==1.9.1
+sympy==1.14.0
+pyyaml==6.0.3
+tqdm==4.70.1
+pytest==9.1.1
+matplotlib==3.11.2
+seaborn==0.13.2
+datasets==5.0.1

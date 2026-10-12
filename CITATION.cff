@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "Please cite the Emotion2Skill manuscript and this software when using the implementation."
+type: software
+title: "Emotion2Skill: LLM-Internal Emotion Signals for Adaptive Skill Selection and Evolution"
+authors:
+  - name: "Emotion2Skill contributors"
+version: 0.2.0
+repository-code: "https://github.com/BoHan-LIN04/Emotion2Skill"
+license: MIT

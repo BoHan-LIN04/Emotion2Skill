@@ -21,7 +21,8 @@ L_ctr : supervised-contrastive loss (Khosla et al., 2020)
 L_cls : cross-entropy over template prototype similarities
         pseudo-labels from k-means (k=C) on raw emotion vectors
 
-Parameters: < 27 K  (tiny; trains in < 10 min on one GPU)
+The MLP backbone has 26,624 parameters; including prototypes and the
+confidence head the encoder has 28,289 trainable parameters.
 """
 
 from __future__ import annotations
@@ -47,31 +48,30 @@ D_PRIME = 128   # encoder output dim
 # 12 natural-language emotion-state templates
 # (designed to span the GoEmotions valence/arousal space)
 # ─────────────────────────────────────────────────────────────────────────────
+TEMPLATE_BANK_VERSION = "appendix-12-v1"
 EMOTION_TEMPLATES: list[str] = [
-    # T1 – high arousal positive
-    "The agent is curious and eager, actively exploring new possibilities.",
-    # T2 – approach / desire
-    "The agent has a clear desire toward an identified goal and is reaching for it.",
-    # T3 – uncertainty / confusion
-    "The agent is confused; the current information is ambiguous or contradictory.",
-    # T4 – frustration / annoyance
-    "The agent is frustrated; repeated attempts have not resolved the situation.",
-    # T5 – approval / confidence
-    "The agent feels confident and approving; the current path looks correct.",
-    # T6 – relief / satisfaction
-    "The agent senses relief; a difficulty has been resolved.",
-    # T7 – nervousness / low-confidence
-    "The agent is nervous; uncertainty is high and stakes feel significant.",
-    # T8 – disappointment
-    "The agent is disappointed; an expected outcome did not materialise.",
-    # T9 – optimism / forward-looking
-    "The agent is optimistic; progress is evident and the goal feels reachable.",
-    # T10 – caring / careful attention
-    "The agent is attending carefully; precision and correctness feel important.",
-    # T11 – low-signal (neutral)
+    "The agent is curious; it is actively seeking new information.",
+    "The agent desires a specific goal and strongly anticipates reaching it.",
+    "The agent is confused or uncertain; the current strategy may fail.",
+    "The agent feels approving and confident in the current direction.",
+    "The agent is optimistic and expects upcoming actions to make progress.",
+    "The agent feels proud and self-assured, with high internal confidence.",
+    "The agent is frustrated or annoyed by repeated obstacles.",
+    "The agent is disappointed; its expectations have not been met.",
+    "The agent is nervous or apprehensive and perceives risk.",
+    "The agent has a sudden realization or insight that changes its strategy.",
+    "The agent feels lightly amused in a low-stakes interaction.",
     "The agent's internal state is neutral; no strong affective signal is present.",
-    # T12 – surprise / realization
-    "The agent is surprised or has just had a realisation that changes its plan.",
+]
+
+# The association is explicit and stored in checkpoints. Cluster numbers have
+# no inherent meaning: centroid-to-profile assignment establishes the mapping.
+TEMPLATE_EMOTION_WEIGHTS: list[dict[str, float]] = [
+    {"curiosity": 1.0}, {"desire": 1.0}, {"confusion": 1.0},
+    {"approval": 1.0}, {"optimism": 1.0}, {"pride": 1.0},
+    {"annoyance": 0.7, "anger": 0.3}, {"disappointment": 1.0},
+    {"nervousness": 0.7, "fear": 0.3},
+    {"realization": 0.8, "surprise": 0.2}, {"amusement": 1.0}, {},
 ]
 
 assert len(EMOTION_TEMPLATES) == C
@@ -167,7 +167,9 @@ def supervised_contrastive_loss(
     """
     Eq. (6): L_ctr — supervised contrastive loss.
 
-    Positive pairs: same skill_label AND both episodes succeeded (y=1).
+    Positive examples j have the same skill label and y_j=1. Failed anchors
+    can still be compared to successful examples of the same skill. Self pairs
+    are excluded; anchors without a positive do not enter the average.
 
     Parameters
     ----------
@@ -190,10 +192,9 @@ def supervised_contrastive_loss(
     self_mask = torch.eye(B, dtype=torch.bool, device=device)
     sim = sim.masked_fill(self_mask, float("-inf"))
 
-    # Positive mask: same skill AND both succeeded
+    # Match the paper's A+(i): a successful positive j, regardless of y_i.
     sk_match = skill_labels.unsqueeze(1) == skill_labels.unsqueeze(0)  # (B, B)
-    both_succ = success_flags.unsqueeze(1) & success_flags.unsqueeze(0)
-    pos_mask  = sk_match & both_succ & ~self_mask                       # (B, B)
+    pos_mask = sk_match & success_flags.unsqueeze(0) & ~self_mask
 
     n_pos = pos_mask.sum(dim=1).clamp(min=1)  # (B,)
 
@@ -253,7 +254,8 @@ def kmeans_pseudo_labels(
     n_clusters: int = C,
     n_iters: int = 100,
     seed: int = 42,
-) -> torch.Tensor:
+    return_centroids: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Simple Lloyd's k-means on emotion vectors to generate pseudo-labels.
 
@@ -266,13 +268,25 @@ def kmeans_pseudo_labels(
     -------
     labels : (N,) LongTensor
     """
-    torch.manual_seed(seed)
+    if e_vectors.ndim != 2 or not torch.isfinite(e_vectors).all():
+        raise ValueError("k-means expects a finite (N, K) feature matrix")
     N, D = e_vectors.shape
-    # Random init from data points
-    idx = torch.randperm(N)[:n_clusters]
+    if N < n_clusters:
+        raise ValueError(f"Need at least {n_clusters} training vectors, got {N}")
+    if torch.unique(e_vectors, dim=0).shape[0] < n_clusters:
+        raise ValueError("Too few distinct feature vectors for the template clusters")
+    generator = torch.Generator(device=e_vectors.device).manual_seed(seed)
+    # k-means++ prevents duplicate centroid initialisation.
+    first = torch.randint(N, (1,), generator=generator, device=e_vectors.device)
+    idx_list = [int(first.item())]
+    for _ in range(1, n_clusters):
+        distances = torch.cdist(e_vectors, e_vectors[idx_list]).square().amin(dim=1)
+        next_idx = torch.multinomial(distances, 1, generator=generator).item()
+        idx_list.append(int(next_idx))
+    idx = torch.tensor(idx_list, device=e_vectors.device)
     centroids = e_vectors[idx].clone()   # (C, D)
 
-    labels = torch.zeros(N, dtype=torch.long)
+    labels = torch.zeros(N, dtype=torch.long, device=e_vectors.device)
     for _ in range(n_iters):
         # Assign
         dists  = torch.cdist(e_vectors, centroids)   # (N, C)
@@ -289,7 +303,39 @@ def kmeans_pseudo_labels(
             break
         centroids = new_centroids
 
-    return labels
+    labels = torch.cdist(e_vectors, centroids).argmin(dim=1)
+    return (labels, centroids) if return_centroids else labels
+
+
+def cluster_template_mapping(
+    semantic_centroids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match clusters to the appendix bank by GoEmotions semantic profiles.
+
+    For a generic-PCA control, these centroids must be computed from the
+    corresponding *emotion* states, not from arbitrary principal components.
+    The neutral profile prefers the least concentrated absolute activation.
+    This is an auditable semantic heuristic, not an annotated ground truth.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    if semantic_centroids.shape != (C, K):
+        raise ValueError(f"Expected semantic centroids of shape {(C, K)}")
+    if not torch.isfinite(semantic_centroids).all():
+        raise ValueError("Semantic centroids contain nonfinite values")
+    profiles = torch.zeros(C, K, dtype=semantic_centroids.dtype,
+                           device=semantic_centroids.device)
+    for j, weights in enumerate(TEMPLATE_EMOTION_WEIGHTS):
+        for emotion, weight in weights.items():
+            profiles[j, GOEMOTIONS_LABELS.index(emotion)] = weight
+    profiles = F.normalize(profiles, dim=1)
+    scores = semantic_centroids @ profiles.T
+    scores[:, -1] = -semantic_centroids.abs().amax(dim=1)
+    cluster_ids, template_ids = linear_sum_assignment(-scores.detach().cpu().numpy())
+    mapping = torch.empty(C, dtype=torch.long, device=semantic_centroids.device)
+    mapping[torch.as_tensor(cluster_ids, device=mapping.device)] = torch.as_tensor(
+        template_ids, device=mapping.device)
+    return mapping, scores
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -343,14 +389,26 @@ class EmotionEncoder:
         checkpoint_path: Optional[str] = None,
         tau: float = 0.3,
         device: str = "cuda",
+        expected_extractor_mode: Optional[str] = None,
+        expected_shuffle_context: Optional[bool] = None,
+        require_trained: bool = False,
     ):
+        if not 0 <= tau <= 1:
+            raise ValueError("tau must be in [0, 1]")
         self.tau    = tau
         self.device = device
         self.model  = EmotionEncoderMLP().to(device)
+        self.metadata: dict = {"trained": False, "confidence_trained": False,
+                               "template_bank": EMOTION_TEMPLATES,
+                               "template_bank_version": TEMPLATE_BANK_VERSION}
+        self.expected_extractor_mode = expected_extractor_mode
+        self.expected_shuffle_context = expected_shuffle_context
+        self.require_trained = require_trained
 
         if checkpoint_path is not None:
-            state = torch.load(checkpoint_path, map_location=device)
-            self.model.load_state_dict(state)
+            self.load(checkpoint_path)
+        elif require_trained:
+            raise ValueError("A trained encoder checkpoint is required for evaluation")
         self.model.eval()
 
     @torch.no_grad()
@@ -367,6 +425,8 @@ class EmotionEncoder:
         -------
         EmotionSummary
         """
+        if e_t.shape != (K,) or not torch.isfinite(e_t).all():
+            raise ValueError(f"Expected a finite emotion vector of shape ({K},)")
         e = e_t.float().unsqueeze(0).to(self.device)   # (1, K)
         r, c = self.model(e)                            # (1, d'), (1,)
         tidx  = self.model.select_template(r).item()   # int
@@ -377,14 +437,41 @@ class EmotionEncoder:
             template_text = EMOTION_TEMPLATES[tidx],
             confidence    = conf,
             emotion_state = e_t.cpu(),
-            is_admitted   = conf >= self.tau,
+            is_admitted   = self.tau < 1.0 and conf >= self.tau,
         )
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.model.state_dict(), path)
+        torch.save({"format_version": 2, "state_dict": self.model.state_dict(),
+                    "metadata": self.metadata}, path)
 
     def load(self, path: str) -> None:
-        state = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(state)
+        payload = torch.load(path, map_location=self.device, weights_only=True)
+        if "state_dict" not in payload:
+            if self.require_trained or self.expected_extractor_mode is not None:
+                raise ValueError("Legacy encoder lacks training/mapping metadata; retrain it")
+            self.model.load_state_dict(payload)
+            self.metadata = {"legacy": True}
+            self.model.eval()
+            return
+        metadata = payload.get("metadata", {})
+        if metadata.get("template_bank") != EMOTION_TEMPLATES:
+            raise ValueError("Encoder template bank differs from the canonical appendix bank")
+        if metadata.get("template_bank_version") != TEMPLATE_BANK_VERSION:
+            raise ValueError("Unsupported encoder template-bank version")
+        if self.require_trained and (not metadata.get("trained") or
+                                     not metadata.get("confidence_trained")):
+            raise ValueError("Encoder checkpoint has no verified confidence training metadata")
+        if self.expected_extractor_mode is not None and metadata.get(
+                "extractor_mode") != self.expected_extractor_mode:
+            raise ValueError("Encoder was trained for a different extractor feature mode")
+        if self.expected_shuffle_context is not None and metadata.get(
+                "shuffle_context") != self.expected_shuffle_context:
+            raise ValueError("Encoder training shuffle control does not match evaluation")
+        mapping = metadata.get("cluster_to_template")
+        if self.require_trained and (not isinstance(mapping, list) or
+                                     sorted(mapping) != list(range(C))):
+            raise ValueError("Encoder checkpoint lacks a valid semantic cluster mapping")
+        self.metadata = metadata
+        self.model.load_state_dict(payload["state_dict"])
         self.model.eval()

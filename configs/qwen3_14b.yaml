@@ -1,14 +1,8 @@
-# Qwen3-14B configuration
-# Inherits from default.yaml; only changed fields listed here.
-
+extends: default.yaml
 model:
-  name_or_path: "Qwen/Qwen3-14B"
-  key: "qwen3-14b"
-
+  name_or_path: Qwen/Qwen3-14B
+  key: qwen3-14b
 extractor:
-  optimal_layer: 26         # L* for Qwen3-14B (40-layer model)
-  layer_grid: [18, 20, 22, 24, 26, 28, 30]
-
-evaluation:
-  n_episodes: 134           # ALFWorld test set size (if running ALFWorld)
-  max_steps: 50
+  checkpoint: checkpoints/extractor_qwen3_14b.pkl
+encoder:
+  checkpoint: checkpoints/encoder_qwen3_14b.pt

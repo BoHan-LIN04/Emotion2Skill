@@ -1,220 +1,68 @@
-"""
-WebShop Environment Interface
-==============================
-Wraps the WebShop gym environment for use with Emotion2Skill.
-
-WebShop (Yao et al., 2022): https://github.com/princeton-nlp/WebShop
-Install: pip install webshop  (or clone + pip install -e .)
-
-This module provides:
-  - WebShopEnv: a thin wrapper around the gym environment
-  - Observation formatting for the agent prompt
-  - Metric computation: Score and Success%
-
-The standard WebShop test split contains 500 tasks.
-We report Score (0–1 continuous) and Succ.% (score >= 1.0).
-"""
-
+"""Adapter for the official WebAgentTextEnv-v0 API; no implicit mocks."""
 from __future__ import annotations
+from .common import BenchmarkStep, ManifestEnv
+WebShopStep = BenchmarkStep
 
-import json
-import os
-from dataclasses import dataclass
-from typing import Any, Optional
+class WebShopEnv(ManifestEnv):
+    benchmark = "webshop"
+    action_instruction = 'Use search[query] or click[button/ASIN/option]. Purchase with click[buy now].'
 
+    def __init__(self, manifest_path=None, split="test", max_steps=15,
+                 observation_mode="text", mock=False, env=None, task_indices=None):
+        self._configure(manifest_path, split, mock, max_steps)
+        if task_indices is not None:
+            self.tasks = [self.tasks[i] for i in task_indices]
+        self.observation_mode, self._env = observation_mode, env
+        if not mock and env is None:
+            try:
+                import gym
+                import web_agent_site.envs
+                options = dict(self.manifest.get("environment", {}))
+                if set(options) - {"file_path", "num_products", "human_goals", "show_attrs"}:
+                    raise ValueError("Unsupported WebShop manifest environment option")
+                self._env = gym.make("WebAgentTextEnv-v0", observation_mode=observation_mode, **options)
+            except Exception as exc:
+                raise RuntimeError("WebShop initialization failed. Install its pinned source, product data and search index; use --mock only for synthetic smoke tests.") from exc
 
-@dataclass
-class WebShopStep:
-    observation: str
-    reward:      float
-    done:        bool
-    info:        dict
-
-
-class WebShopEnv:
-    """
-    Wrapper around the WebShop gym environment.
-
-    Parameters
-    ----------
-    split       : "test" | "train" | "dev"
-    max_steps   : maximum steps per episode (paper uses 15)
-    observation_mode : "html" | "text" (text is cleaner for LLM agents)
-    task_indices : optional list of task indices to evaluate on (subset)
-    """
-
-    def __init__(
-        self,
-        split:            str = "test",
-        max_steps:        int = 15,
-        observation_mode: str = "text",
-        task_indices:     Optional[list[int]] = None,
-    ):
-        self.split            = split
-        self.max_steps        = max_steps
-        self.observation_mode = observation_mode
-        self.task_indices     = task_indices
-        self._env             = None
-        self._step_count      = 0
-        self._current_task_id = None
-
-        self._init_env()
-
-    def _init_env(self) -> None:
-        """Lazy import so the file can be loaded without WebShop installed."""
-        try:
-            import gym  # noqa: F401
-            # WebShop registers "WebShop-v0" on import
-            import web_agent_site.envs  # noqa: F401
-            import gym as _gym
-            self._env = _gym.make(
-                "WebShop-v0",
-                observation_mode=self.observation_mode,
-            )
-        except ImportError:
-            print(
-                "[WebShopEnv] WebShop not installed. "
-                "Clone https://github.com/princeton-nlp/WebShop and "
-                "run `pip install -e .` in its root directory."
-            )
-            self._env = None
-
-    # ── public API ────────────────────────────────────────────────────────────
-
-    def reset(self, task_idx: Optional[int] = None) -> str:
-        """
-        Reset the environment to a new task.
-
-        Parameters
-        ----------
-        task_idx : index into the test split (if None, cycles sequentially)
-
-        Returns
-        -------
-        observation : str — the initial task instruction + product page
-        """
-        if self._env is None:
-            return self._mock_reset(task_idx)
-
-        self._step_count = 0
-        if task_idx is not None:
-            obs = self._env.reset(idx=task_idx)
+    def reset(self, task_idx=None):
+        task = self._choose_task(task_idx)
+        if self.mock:
+            self._goal = "Synthetic task: buy a blue cotton shirt under $50."
+            self._current_obs = self._goal + "\nSearch bar available."
         else:
-            obs = self._env.reset()
-        self._current_task_id = task_idx
-        return self._format_observation(obs)
+            value = self._env.reset(session=task["index"])
+            obs = value[0] if isinstance(value, tuple) else value
+            if not isinstance(obs, str):
+                raise TypeError("WebShop reset must return a text observation.")
+            self._current_obs = obs
+            inner = getattr(self._env, "unwrapped", self._env)
+            self._goal = inner.get_instruction_text()
+        return self._current_obs, self._goal
 
-    def step(self, action: str) -> WebShopStep:
-        """
-        Execute an action string and return the next observation.
-
-        Valid action formats (WebShop):
-          - "search[<query>]"
-          - "click[<button_text>]"
-          - "stop[<product_url>]"  (submit purchase)
-
-        Returns
-        -------
-        WebShopStep with observation, reward ∈ [0, 1], done flag, and info.
-        """
-        if self._env is None:
-            return self._mock_step(action)
-
+    def step(self, action):
         self._step_count += 1
-        obs, reward, done, info = self._env.step(action)
+        if self.mock:
+            done = self._step_count >= self.max_steps or action.lower() == "click[buy now]"
+            reward = 0.85 if done else 0.0
+            obs, info = f"[Synthetic] {action}", {"synthetic": True}
+        else:
+            value = self._env.step(action)
+            if len(value) == 5:
+                obs, reward, terminated, truncated, info = value
+                done = terminated or truncated
+            else:
+                obs, reward, done, info = value
+            done = bool(done) or self._step_count >= self.max_steps
+        self._current_obs = str(obs)
+        return BenchmarkStep(self._current_obs, float(reward), bool(done), bool(done and reward >= 1), info or {})
 
-        if self._step_count >= self.max_steps:
-            done = True
-
-        return WebShopStep(
-            observation = self._format_observation(obs),
-            reward      = float(reward),
-            done        = done,
-            info        = info or {},
-        )
-
-    def task_instruction(self) -> str:
-        """Return the current task goal as a clean string."""
-        if self._env is None:
-            return "Buy a blue cotton shirt under $50."
-        # The goal is embedded in the first observation; extract it
-        obs = self._env.observation
-        if "Instruction:" in obs:
-            start = obs.index("Instruction:") + len("Instruction:")
-            end   = obs.find("\n", start)
-            return obs[start:end].strip()
-        return obs[:200]
-
-    # ── formatting ────────────────────────────────────────────────────────────
+    def close(self):
+        if self._env is not None and callable(getattr(self._env, "close", None)):
+            self._env.close()
 
     @staticmethod
-    def _format_observation(raw_obs: str) -> str:
-        """Clean up raw WebShop HTML/text observation for LLM consumption."""
-        # Remove excess whitespace
-        lines = [l.strip() for l in raw_obs.split("\n") if l.strip()]
-        return "\n".join(lines)
-
-    def format_context(
-        self,
-        instruction:  str,
-        history:      list[tuple[str, str]],   # [(action, observation), ...]
-        current_obs:  str,
-    ) -> str:
-        """
-        Build the x_t context string for the skill-selection prompt.
-        """
-        parts = [f"Task Goal: {instruction}", ""]
-        if history:
-            parts.append("Previous Steps:")
-            for i, (act, obs) in enumerate(history[-5:], 1):  # last 5 steps
-                parts.append(f"  Step {i}: action={act}")
-                parts.append(f"           obs={obs[:120]}")
-            parts.append("")
-        parts.append(f"Current Observation:\n{current_obs}")
-        return "\n".join(parts)
-
-    # ── metrics ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def compute_metrics(scores: list[float]) -> dict[str, float]:
-        """
-        Compute WebShop evaluation metrics.
-
-        Parameters
-        ----------
-        scores : list of per-episode scores ∈ [0, 1]
-
-        Returns
-        -------
-        {"score": float, "success_rate": float}
-        """
-        n = len(scores)
-        if n == 0:
-            return {"score": 0.0, "success_rate": 0.0}
-        avg_score = sum(scores) / n
-        success   = sum(1 for s in scores if s >= 1.0) / n * 100
-        return {
-            "score":        round(avg_score * 100, 1),
-            "success_rate": round(success, 1),
-        }
-
-    # ── mock methods (for unit testing without WebShop installed) ─────────────
-
-    def _mock_reset(self, task_idx: Optional[int] = None) -> str:
-        self._step_count = 0
-        return (
-            "Instruction: Buy a blue cotton shirt with short sleeves "
-            "and a price lower than $50.00.\n"
-            "Search bar available."
-        )
-
-    def _mock_step(self, action: str) -> WebShopStep:
-        self._step_count += 1
-        done = self._step_count >= self.max_steps or action.startswith("stop[")
-        reward = 0.85 if done else 0.0
-        return WebShopStep(
-            observation = f"[Mock] After action: {action}",
-            reward      = reward,
-            done        = done,
-            info        = {},
-        )
+    def compute_metrics(scores):
+        if not scores:
+            raise ValueError("Cannot report metrics for an empty evaluation.")
+        return {"score": sum(scores) / len(scores) * 100,
+                "success_rate": sum(s >= 1 for s in scores) / len(scores) * 100}

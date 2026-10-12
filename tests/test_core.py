@@ -225,12 +225,12 @@ class TestSkillSelector:
         result = sel.select("Find a shirt under $50.", lib)
         assert result.skill_name in lib.names()
 
-    def test_parse_fallback(self):
+    def test_invalid_selection_is_rejected(self):
         lib = get_library("webshop")
         # LLM returns garbage
         sel = SkillSelector(lambda s, u: "UNKNOWN SKILL XYZ")
-        result = sel.select("test", lib)
-        assert result.skill_name in lib.names()   # fallback to first skill
+        with pytest.raises(ValueError, match="Invalid skill selection"):
+            sel.select("test", lib)
 
     def test_emotion_not_admitted(self):
         from emotion2skill.encoder import EmotionSummary

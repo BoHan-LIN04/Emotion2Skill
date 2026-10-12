@@ -20,8 +20,8 @@ logs/
 results/
 
 # Data (generated at runtime)
-data/emotion_stories/stories.json
-data/goemotions/
+data/*
+!data/LICENSE
 
 # Environment
 .env

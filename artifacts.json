@@ -1,0 +1,14 @@
+{
+  "release_version": "0.2.0",
+  "reported_results_source": "supplied manuscript; not rerun by this software repair",
+  "required_for_original_result_reproduction": [
+    {"artifact": "original 2700 emotion stories", "status": "not_supplied", "path": "data/emotion_stories/stories.json"},
+    {"artifact": "fixed benchmark train/dev/test task manifests", "status": "not_supplied", "path": "manifests/"},
+    {"artifact": "8B and 14B emotion extractors and shared encoders", "status": "not_supplied", "path": "checkpoints/"},
+    {"artifact": "three original independent-run traces and SOP versions", "status": "not_supplied", "path": "results/"},
+    {"artifact": "source-pinned MASA, AlignEvoSkill and Trace2Skill implementations", "status": "external_integration_required"},
+    {"artifact": "GPT-4o judgments and human annotation subset", "status": "not_supplied"}
+  ],
+  "generation_tools": ["scripts/prepare_goemotions.py", "scripts/prepare_benchmarks.py", "scripts/build_extractor.py", "train_encoder.py", "evaluate.py", "scripts/analyze_results.py"],
+  "generation_note": "Newly generated assets are new experiment inputs; they cannot establish identity with the original manuscript runs."
+}

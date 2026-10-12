@@ -1,528 +1,463 @@
-"""
-Emotion2Skill Agent  (Algorithm 1)
-====================================
-Implements the full online loop from Algorithm 1 of the paper:
-
-  FOR each episode:
-    FOR each decision step t:
-      1. Extract e_t from the residual stream (EmotionExtractor)
-      2. Encode (r_t, c_t) via EmotionEncoder
-      3. Build augmented prompt P_t
-      4. Select skill s_t* via LLM (SkillSelector)
-      5. Translate skill → concrete action via LLM (ActionExecutor)
-      6. Step environment; log StepRecord
-    END FOR
-  END FOR
-
-  FOR each evolution round r:
-    run SkillEvolutionEngine.run_round(library, batch)
-  END FOR
-
-The agent wraps Qwen3 (HuggingFace) in non-thinking mode with greedy
-decoding, and provides a unified LLM callable used by all sub-modules.
-"""
-
+"""Online routing, execution and complete, non-overwriting run evidence."""
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
+import random
+import re
 import time
-from dataclasses import dataclass, field
+import uuid
+from types import SimpleNamespace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from .encoder import EmotionEncoder, EmotionSummary
-from .evolution import (
-    EpisodeLog,
-    SkillEvolutionEngine,
-    SkillPerformanceTracker,
-    StepRecord,
-)
-from .extraction import EmotionExtractor
-from .selection import SelectionResult, SkillLibrary, SkillSelector
+from .evolution import EpisodeLog, SkillEvolutionEngine, SkillPerformanceTracker, StepRecord
+from .selection import SELECTION_SYSTEM, SkillLibrary, SkillSelector, build_selection_prompt
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Qwen3 LLM wrapper
-# ─────────────────────────────────────────────────────────────────────────────
+def validate_inference_assets(config, require_encoder: bool = True) -> dict:
+    """Check local feature/encoder artifacts before downloading backbone weights."""
+    import pickle
+    import numpy as np
+    if not config.extractor_path or not Path(config.extractor_path).is_file():
+        raise FileNotFoundError("A built extractor checkpoint is required; build it offline before running.")
+    if require_encoder and config.encoder_mode == "learned" and (
+            not config.encoder_path or not Path(config.encoder_path).is_file()):
+        raise FileNotFoundError("Full emotion inference requires a trained encoder checkpoint.")
+    with open(config.extractor_path, "rb") as stream:
+        payload = pickle.load(stream)
+    if payload.get("format_version") != 2 or payload.get("model_key") != config.model_key:
+        raise ValueError("Extractor checkpoint schema/model does not match the requested backbone.")
+    matrices = payload.get("matrices", {})
+    if config.extractor_mode not in matrices or payload.get("L_star") is None:
+        raise ValueError("Extractor checkpoint lacks the requested feature mode or extraction layer.")
+    matrix = np.asarray(matrices[config.extractor_mode])
+    from .extraction import LAYER_GRID
+    expected = {"qwen3-8b": (4096, 36), "qwen3-14b": (5120, 40)}
+    if config.model_key not in expected:
+        raise ValueError("Only explicitly declared Qwen3-8B/14B backbone geometries are supported.")
+    width, layers = expected[config.model_key]
+    if matrix.shape != (27, width) or not np.isfinite(matrix).all():
+        raise ValueError(f"Extractor matrix must be finite with shape {(27, width)} for {config.model_key}.")
+    layer = payload["L_star"]
+    if not isinstance(layer, int) or not 0 <= layer < layers or layer not in LAYER_GRID[config.model_key]:
+        raise ValueError("The extractor layer is outside the declared backbone candidate grid.")
+    if payload.get("metadata", {}).get("selection_split") != "validation":
+        raise ValueError("Extractor checkpoint must record validation-only layer selection.")
+    if config.extractor_mode == "generic_pca" and payload.get("metadata", {}).get(
+            "generic_pca", {}).get("fit_split") != "train":
+        raise ValueError("Generic PCA features require a recorded train-only fit.")
+    metadata = payload.get("metadata", {})
+    if Path(config.model_name_or_path).expanduser().is_dir():
+        from .provenance import local_model_identity
+        identity = local_model_identity(config.model_name_or_path)
+        if metadata.get("model_identity") != identity:
+            raise ValueError("Local backbone/tokenizer content does not match the extractor model identity.")
+        revision = None
+    else:
+        revision = metadata.get("model_revision")
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("Remote extractor checkpoints require the resolved immutable model commit SHA.")
+        if getattr(config, "model_revision", None) not in (None, revision):
+            raise ValueError("Requested model revision differs from the extractor checkpoint revision.")
+        config.model_revision = revision
+    if require_encoder and config.encoder_mode == "learned":
+        from .encoder import EmotionEncoder
+        # A tiny CPU encoder validates state shapes and provenance without any backbone.
+        encoder = EmotionEncoder(config.encoder_path, tau=config.tau, device="cpu", require_trained=True,
+            expected_extractor_mode=config.extractor_mode,
+            expected_shuffle_context=config.shuffle_context)
+        source = encoder.metadata.get("source", {})
+        actual_hash = hashlib.sha256(Path(config.extractor_path).read_bytes()).hexdigest()
+        if not config.mock and source.get("extractor_sha256") != actual_hash:
+            raise ValueError("Encoder provenance does not match the current extractor checkpoint SHA-256.")
+        declared_model = source.get("effective_config", {}).get("model", {}).get("key")
+        if declared_model is not None and declared_model != config.model_key:
+            raise ValueError("Encoder provenance declares a different backbone model key.")
+    return {"extractor_format_version": payload["format_version"], "mode": config.extractor_mode,
+            "model_revision": revision, "model_identity": metadata.get("model_identity")}
+
 
 class Qwen3LLM:
-    """
-    Non-thinking mode, greedy decoding wrapper around Qwen3.
-
-    Used as the single `llm_callable` threaded through all sub-modules.
-    """
-
-    def __init__(
-        self,
-        model_name_or_path: str,
-        device: str = "cuda",
-        max_new_tokens: int = 512,
-    ):
-        self.device         = device
-        self.max_new_tokens = max_new_tokens
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name_or_path, trust_remote_code=True
-        )
+    """One shared backbone with greedy generation and exact candidate scoring."""
+    def __init__(self, model_name_or_path: str, device: str = "cuda", max_new_tokens: int = 512,
+                 max_context_tokens: Optional[int] = None, revision: Optional[str] = None):
+        import torch
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        self.device, self.max_new_tokens = device, max_new_tokens
+        self.max_context_tokens = max_context_tokens
+        if revision is None and not Path(model_name_or_path).expanduser().is_dir():
+            resolved = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+            revision = getattr(resolved, "_commit_hash", None)
+            if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+                raise ValueError("Resolve an immutable backbone revision before loading model/tokenizer assets.")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True, revision=revision)
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.float16,
-            device_map=device,
-            trust_remote_code=True,
-        ).eval()
+            model_name_or_path, torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+            device_map=device, trust_remote_code=True, revision=revision).eval()
+        self.resolved_model_revision = getattr(self.model.config, "_commit_hash", None)
+        if revision and self.resolved_model_revision != revision:
+            raise ValueError("Loaded model commit does not match the requested immutable revision.")
+        from .provenance import local_model_identity
+        self.model_identity = local_model_identity(model_name_or_path)
+        self.model._emotion2skill_asset_identity = self.model_identity
+
+    def chat_prefix(self, system: str, user: str) -> str:
+        return self.tokenizer.apply_chat_template(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            tokenize=False, add_generation_prompt=True, enable_thinking=False)
+
+    def count_prompt_tokens(self, system: str, user: str) -> int:
+        return len(self.tokenizer.encode(self.chat_prefix(system, user), add_special_tokens=False))
+
+    def _inputs(self, text: str, reserve_generation: bool = False):
+        inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        reserved = self.max_new_tokens if reserve_generation else 0
+        if self.max_context_tokens and inputs["input_ids"].shape[1] + reserved > self.max_context_tokens:
+            raise ValueError("Prompt exceeds the configured context budget; no silent truncation is allowed.")
+        return inputs.to(self.model.device)
 
     def __call__(self, system: str, user: str) -> str:
-        """
-        Call the LLM with a system + user prompt.
-        Returns the generated text (non-thinking mode, greedy decoding).
-        """
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ]
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,   # non-thinking mode
-        )
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
-
+        import torch
+        inputs = self._inputs(self.chat_prefix(system, user), reserve_generation=True)
         with torch.no_grad():
-            ids = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,          # greedy
-                temperature=1.0,
-                repetition_penalty=1.05,
-            )
-
+            ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
         generated = ids[0][inputs["input_ids"].shape[1]:]
         return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
 
+    def score_candidates(self, system: str, user: str, candidates: list[str]) -> dict[str, float]:
+        """Return log p(identifier | complete chat generation prefix), without length normalization."""
+        import torch
+        prefix = self._inputs(self.chat_prefix(system, user))["input_ids"]
+        prefix_length = prefix.shape[1]
+        scores = {}
+        for candidate in candidates:
+            ids = self.tokenizer.encode(candidate, add_special_tokens=False)
+            if not ids:
+                raise ValueError("A candidate identifier must contain at least one token.")
+            suffix = torch.tensor([ids], dtype=prefix.dtype, device=prefix.device)
+            joined = torch.cat([prefix, suffix], dim=1)
+            if self.max_context_tokens and joined.shape[1] > self.max_context_tokens:
+                raise ValueError("Candidate scoring exceeds the configured context budget.")
+            with torch.no_grad():
+                logits = self.model(input_ids=joined, attention_mask=torch.ones_like(joined)).logits
+                positions = logits[0, prefix_length - 1:joined.shape[1] - 1].float()
+                score = positions.log_softmax(dim=-1).gather(1, suffix[0].unsqueeze(1)).sum()
+            scores[candidate] = float(score.item())
+        return scores
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Action executor: skill SOP → concrete environment action
-# ─────────────────────────────────────────────────────────────────────────────
 
-ACTION_SYSTEM = """\
-You are an autonomous agent. Given the current observation and the selected \
-skill's instructions, generate the SINGLE next action to execute in the \
-environment. Output ONLY the action string — nothing else."""
-
-ACTION_USER_TEMPLATE = """\
-## Current Observation
-{observation}
-
-## Selected Skill
-{skill_name}
-
-## Skill SOP (Standard Operating Procedure)
-{skill_sop}
-
-## History (last 4 steps)
-{history_str}
-
-## Instruction
-Generate the single next action to execute. \
-For WebShop: use format like "search[query]" or "click[button]" or "stop[url]". \
-For ALFWorld: use plain English like "pick up tomato 1" or "go to microwave 1". \
-Action:\
-"""
+ACTION_SYSTEM = ("You are an autonomous agent. Follow the task goal, current observation, "
+                 "selected skill and environment action syntax. Output ONLY the single next action.")
 
 
 class ActionExecutor:
-    """Translates a selected skill into a concrete environment action."""
-
     def __init__(self, llm_callable):
         self._llm = llm_callable
+        self.last_prompt = ""
+        self.last_raw_output = ""
 
-    def execute(
-        self,
-        observation:  str,
-        skill_name:   str,
-        skill_sop:    str,
-        history:      list[tuple[str, str]],
-    ) -> str:
-        history_str = "\n".join(
-            f"  [{i+1}] > {act}\n       {obs[:80]}"
-            for i, (act, obs) in enumerate(history[-4:])
-        ) if history else "(no prior steps)"
+    def execute(self, observation: str, skill_name: str, skill_sop: str,
+                history: list[tuple[str, str]], context: Optional[str] = None,
+                action_instruction: str = "Output the single valid environment action.",
+                reasoning: bool = False) -> str:
+        full_context = context if context is not None else (
+            f"Current Observation:\n{observation}\nHistory:\n" +
+            "\n".join(f"Action: {act}\nObservation: {obs}" for act, obs in history))
+        self.last_prompt = (f"## Task and Agent Context\n{full_context}\n\n"
+                            f"## Selected Skill\n{skill_name}\n\n## Skill SOP\n{skill_sop}\n\n"
+                            f"## Environment Action Syntax\n{action_instruction}\n\nNext action:")
+        system = ACTION_SYSTEM
+        if reasoning:
+            system = "Use ReAct reasoning with the selected skill, then produce a single environment action."
+            self.last_prompt += "\nOutput 'Thought: <reasoning>' followed by 'Action: <next action>'."
+        self.last_raw_output = self._llm(system, self.last_prompt).strip()
+        if not self.last_raw_output:
+            raise ValueError("The action executor returned an empty action.")
+        if reasoning:
+            from .baselines import parse_react_action
+            return parse_react_action(self.last_raw_output)[1]
+        return self.last_raw_output
 
-        user = ACTION_USER_TEMPLATE.format(
-            observation = observation[:500],
-            skill_name  = skill_name,
-            skill_sop   = skill_sop,
-            history_str = history_str,
-        )
-        return self._llm(ACTION_SYSTEM, user).strip()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Agent configuration
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class AgentConfig:
-    """
-    All hyper-parameters for the Emotion2Skill agent.
-    """
-    # Model
-    model_name_or_path: str    = "Qwen/Qwen3-8B"
-    model_key:          str    = "qwen3-8b"         # for extractor
-    device:             str    = "cuda"
+    model_name_or_path: str = "Qwen/Qwen3-8B"
+    model_key: str = "qwen3-8b"
+    model_revision: Optional[str] = None
+    device: str = "cuda"
+    extractor_path: Optional[str] = None
+    stories_path: str = "data/emotion_stories/stories.json"
+    goemotions_validation: str = "data/goemotions/validation.json"
+    goemotions_test: str = "data/goemotions/test.json"
+    encoder_path: Optional[str] = None
+    tau: float = 0.3
+    evolution_rounds: int = 3
+    eta: float = 0.4
+    evolution_window: int = 100
+    max_steps: int = 50
+    max_context_tokens: Optional[int] = None
+    log_dir: str = "logs"
+    run_id: Optional[str] = None
+    seed: int = 42
+    mock: bool = False
+    ablation_mode: str = "full"
+    extractor_mode: str = "contrastive"
+    evolution_diagnostics: bool = True
+    encoder_mode: str = "learned"
+    shuffle_context: bool = False
+    evolution_mode: str = "emotion"
+    benchmark: str = ""
+    warmup_policy: str = "react_skill"
 
-    # Extractor
-    extractor_path:     Optional[str] = None         # precomputed W_e path
-    stories_path:       str    = "data/emotion_stories/stories.json"
-    goemotions_test:    str    = "data/goemotions/test.json"
-
-    # Encoder
-    encoder_path:       Optional[str] = None         # precomputed encoder ckpt
-    tau:                float  = 0.3                 # confidence gate threshold
-
-    # Evolution
-    evolution_rounds:   int    = 5
-    eta:                float  = 0.5                 # underperformance threshold
-    evolution_window:   int    = 20                  # rolling window
-
-    # Episode
-    max_steps:          int    = 50
-
-    # Output
-    log_dir:            str    = "logs"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main Agent
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Emotion2SkillAgent:
-    """
-    Full Emotion2Skill agent implementing Algorithm 1.
-
-    Usage
-    -----
-    >>> agent = Emotion2SkillAgent(config)
-    >>> agent.load()                          # load extractor + encoder
-    >>> results = agent.run_episodes(env, library, n_episodes=134)
-    """
-
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config: AgentConfig, llm=None, validate_extractor: bool = True):
         self.config = config
+        if llm is None and config.extractor_path and validate_extractor:
+            # The initial validation sets the checkpoint-pinned revision before
+            # any expensive remote model/tokenizer load; encoder checks are repeated by load().
+            validate_inference_assets(config, require_encoder=False)
+        self.llm = llm if llm is not None else Qwen3LLM(
+            config.model_name_or_path, config.device, max_context_tokens=config.max_context_tokens,
+            revision=config.model_revision)
+        self.extractor = None
+        self.encoder = None
+        self.selector = SkillSelector(self.llm)
+        self.executor = ActionExecutor(self.llm)
+        self.tracker = SkillPerformanceTracker(config.eta, config.evolution_window)
+        self.evolver = SkillEvolutionEngine(self.llm, self.tracker, eta=config.eta,
+            diagnostics_enabled=config.evolution_diagnostics and config.evolution_mode == "emotion")
+        self.run_id = config.run_id or f"run_{uuid.uuid4().hex}"
+        self._segments = 0
+        self._active_run_path: Optional[Path] = None
+        self._active_phase = "evaluation"
+        self._active_round = 0
+        self._action_instruction = ""
 
-        # LLM (shared across all sub-modules)
-        self.llm = Qwen3LLM(
-            config.model_name_or_path,
-            device=config.device,
-        )
-
-        # Sub-modules (populated in load())
-        self.extractor: Optional[EmotionExtractor] = None
-        self.encoder:   Optional[EmotionEncoder]   = None
-        self.selector   = SkillSelector(self.llm)
-        self.executor   = ActionExecutor(self.llm)
-        self.tracker    = SkillPerformanceTracker(
-            eta=config.eta, window=config.evolution_window
-        )
-        self.evolver    = SkillEvolutionEngine(
-            self.llm, self.tracker, eta=config.eta
-        )
-
-        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
-
-    # ── setup ─────────────────────────────────────────────────────────────────
-
-    def load(self) -> None:
-        """Load (or build) the emotion extractor and encoder."""
+    def load(self, load_emotion: bool = True, require_encoder: bool = True) -> None:
+        if not load_emotion:
+            return
+        validate_inference_assets(self.config, require_encoder=require_encoder)
+        from .extraction import EmotionExtractor
+        from .encoder import EmotionEncoder
         cfg = self.config
+        if not cfg.extractor_path or not Path(cfg.extractor_path).is_file():
+            raise FileNotFoundError("A built extractor checkpoint is required; build it offline before running.")
+        self.extractor = EmotionExtractor.load(cfg.extractor_path, cfg.model_name_or_path, cfg.device,
+            model=self.llm.model, tokenizer=self.llm.tokenizer, revision=cfg.model_revision)
+        if getattr(self.extractor, "mode", "contrastive") != cfg.extractor_mode:
+            self.extractor = self.extractor.with_mode(cfg.extractor_mode)
+        if require_encoder and cfg.encoder_mode == "learned":
+            if not cfg.encoder_path or not Path(cfg.encoder_path).is_file():
+                raise FileNotFoundError("Full emotion inference requires a trained encoder checkpoint.")
+            self.encoder = EmotionEncoder(checkpoint_path=cfg.encoder_path, tau=cfg.tau,
+                device=cfg.device, require_trained=True,
+                expected_extractor_mode=self.extractor.mode,
+                expected_shuffle_context=cfg.shuffle_context)
 
-        # Extractor
-        if cfg.extractor_path and Path(cfg.extractor_path).exists():
-            print(f"Loading extractor from {cfg.extractor_path}")
-            self.extractor = EmotionExtractor.load(
-                cfg.extractor_path, cfg.model_name_or_path, cfg.device
-            )
-        else:
-            print("Building extractor (this takes a while)…")
-            self.extractor = EmotionExtractor(
-                cfg.model_name_or_path, cfg.model_key, cfg.device
-            )
-            self.extractor.build(
-                stories_path        = cfg.stories_path,
-                goemotions_test_path = cfg.goemotions_test,
-                save_path           = cfg.extractor_path,
-            )
+    def _get_emotion(self, extraction_prompt: str, encode: bool = True):
+        if self.extractor is None:
+            raise RuntimeError("Emotion collection requires a loaded extractor.")
+        state = self.extractor.get_emotion_state(extraction_prompt)
+        if encode:
+            if self.config.encoder_mode == "top3":
+                from .extraction import GOEMOTIONS_LABELS
+                indices = sorted(range(len(state)), key=lambda i: float(state[i]), reverse=True)[:3]
+                text = "Top-3 active states: " + ", ".join(GOEMOTIONS_LABELS[i] for i in indices)
+                summary = SimpleNamespace(template_idx=-1, template_text=text, confidence=1.0,
+                    emotion_state=state, is_admitted=self.config.tau < 1.0,
+                    to_prompt_str=lambda: text)
+                return state, summary
+            if self.encoder is None:
+                raise RuntimeError("Emotion injection requires a trained encoder; use collect_emotion for warm-up.")
+            summary = self.encoder.encode(state)
+            if self.config.tau >= 1.0:
+                summary.is_admitted = False
+            return state, summary
+        return state, None
 
-        # Encoder
-        self.encoder = EmotionEncoder(
-            checkpoint_path = cfg.encoder_path,
-            tau             = cfg.tau,
-            device          = cfg.device,
-        )
-
-    # ── single-step logic ─────────────────────────────────────────────────────
-
-    def _get_emotion(self, prompt_text: str) -> Optional[EmotionSummary]:
-        """Extract emotion state and encode it into a summary."""
-        if self.extractor is None or self.encoder is None:
-            return None
-        try:
-            e_t    = self.extractor.get_emotion_state(prompt_text)
-            return self.encoder.encode(e_t)
-        except Exception as e:
-            print(f"  [Emotion] extraction failed: {e}")
-            return None
-
-    def _step(
-        self,
-        t:            int,
-        observation:  str,
-        context:      str,
-        library:      SkillLibrary,
-        history:      list[tuple[str, str]],
-        use_emotion:  bool = True,
-    ) -> tuple[StepRecord, str]:
-        """
-        Execute one decision step.
-
-        Returns
-        -------
-        (StepRecord, action_string)
-        """
-        # 1. Emotion extraction (on the context string used as prompt seed)
-        emotion: Optional[EmotionSummary] = (
-            self._get_emotion(context) if use_emotion else None
-        )
-
-        # 2. Skill selection
-        sel: SelectionResult = self.selector.select(
-            context=context, library=library, emotion=emotion
-        )
-
-        # 3. Action generation from selected skill
-        skill    = library[sel.skill_name]
-        action   = self.executor.execute(
-            observation=observation,
-            skill_name=skill.name,
-            skill_sop=skill.sop,
-            history=history,
-        )
-
-        # 4. Build step record
-        record = StepRecord(
-            step           = t,
-            observation    = observation,
-            skill_selected = sel.skill_name,
-            template_idx   = emotion.template_idx if emotion else 0,
-            confidence     = emotion.confidence   if emotion else 0.0,
-            emotion_state  = (
-                emotion.emotion_state if emotion else torch.zeros(27)
-            ),
-            action_taken   = action,
-            reward         = 0.0,  # filled in after env.step()
-        )
-
+    def _step(self, t: int, observation: str, context: str, library: SkillLibrary,
+              history: list[tuple[str, str]], use_emotion: bool = True,
+              collect_emotion: Optional[bool] = None) -> tuple[StepRecord, str]:
+        collect = use_emotion if collect_emotion is None else (collect_emotion or use_emotion)
+        started = time.perf_counter()
+        summary, state, extraction_prompt = None, [], ""
+        if collect:
+            base_prompt = build_selection_prompt(context, library, None)
+            if not callable(getattr(self.llm, "chat_prefix", None)):
+                raise TypeError("Emotion extraction requires an LLM with the actual chat_prefix interface.")
+            extraction_prompt = self.llm.chat_prefix(SELECTION_SYSTEM, base_prompt)
+            state, summary = self._get_emotion(extraction_prompt, encode=use_emotion)
+        selection = self.selector.select(context=context, library=library, emotion=summary)
+        skill = library[selection.skill_name]
+        action_context = context
+        if summary is not None and summary.is_admitted:
+            action_context += "\n\nAgent Internal State:\n" + summary.to_prompt_str()
+        action = self.executor.execute(observation, skill.name, skill.sop, history,
+            context=action_context, action_instruction=self._action_instruction,
+            reasoning=collect and not use_emotion and self.config.warmup_policy == "react_skill")
+        record = StepRecord(step=t, observation=observation, context=context,
+            skill_selected=selection.skill_name, template_idx=summary.template_idx if summary else -1,
+            template_text=summary.template_text if summary else "",
+            confidence=summary.confidence if summary else 0.0, emotion_state=state,
+            emotion_used=selection.emotion_used, action_taken=action, reward=0.0,
+            extraction_prompt=extraction_prompt, selection_prompt=selection.prompt,
+            selection_raw_output=selection.raw_output, candidate_scores=selection.candidate_scores,
+            action_prompt=self.executor.last_prompt, action_raw_output=self.executor.last_raw_output,
+            decision_seconds=time.perf_counter() - started)
         return record, action
 
-    # ── episode loop ──────────────────────────────────────────────────────────
-
-    def run_episode(
-        self,
-        env,
-        library:     SkillLibrary,
-        episode_id:  str        = "ep_0",
-        use_emotion: bool       = True,
-        verbose:     bool       = False,
-        format_context_fn=None,  # env-specific context formatter
-    ) -> EpisodeLog:
-        """
-        Run a single episode.
-
-        Parameters
-        ----------
-        env               : WebShopEnv or ALFWorldEnv (after reset() called)
-        library           : current skill library S
-        episode_id        : string identifier for logging
-        use_emotion       : if False, fall back to text-only selection
-        format_context_fn : callable(task_goal, history, obs) -> str
-                            (bound to the env's format_context method)
-
-        Returns
-        -------
-        EpisodeLog
-        """
-        log     = EpisodeLog(episode_id=episode_id)
+    def run_episode(self, env, library: SkillLibrary, episode_id: str = "ep_0",
+                    use_emotion: bool = True, collect_emotion: Optional[bool] = None,
+                    verbose: bool = False, format_context_fn=None,
+                    initial_observation: Optional[str] = None, task_goal: Optional[str] = None) -> EpisodeLog:
+        if initial_observation is None or task_goal is None:
+            raise ValueError("Pass both values returned by env.reset as initial_observation and task_goal.")
+        log = EpisodeLog(episode_id=episode_id, task_id=str(getattr(env, "task_id", episode_id)),
+            benchmark=getattr(env, "benchmark", self.config.benchmark),
+            task_type=str(getattr(env, "task_type", "")), backend=str(getattr(env, "backend", "unknown")),
+            split=str(getattr(env, "split", "unknown")), task_goal=task_goal, run_id=self.run_id,
+            seed=self.config.seed, phase=self._active_phase, round_id=self._active_round)
         history: list[tuple[str, str]] = []
-
-        # Get initial observation
-        if hasattr(env, "task_instruction"):
-            task_goal = env.task_instruction()
-            observation = ""
-        else:
-            observation, task_goal = "", ""
-
+        reasoning_history: list[str] = []
+        observation = initial_observation
+        self._action_instruction = getattr(env, "action_instruction", "Output one valid environment action.")
         for t in range(self.config.max_steps):
-            if not observation and hasattr(env, "_current_obs"):
-                observation = env._current_obs
-
-            # Build context x_t
-            if format_context_fn is not None:
-                context = format_context_fn(task_goal, history, observation)
+            formatter = format_context_fn or getattr(env, "format_context", None)
+            if formatter is not None:
+                context = formatter(task_goal, history, observation)
             else:
-                context = f"Task: {task_goal}\n\nObservation: {observation}"
-
-            # Decision step
-            record, action = self._step(
-                t=t,
-                observation=observation,
-                context=context,
-                library=library,
-                history=history,
-                use_emotion=use_emotion,
-            )
-
-            if verbose:
-                admitted = "✓" if (record.confidence >= self.config.tau) else "✗"
-                print(
-                    f"  t={t:2d} | skill={record.skill_selected:20s} | "
-                    f"c={record.confidence:.2f}{admitted} | "
-                    f"action={action[:60]}"
-                )
-
-            # Environment step
-            step_result = env.step(action)
-            record.reward = step_result.reward
+                context = (f"Task Goal: {task_goal}\n\nHistory:\n" +
+                    "\n".join(f"Action: {a}\nObservation: {o}" for a, o in history) +
+                    f"\n\nCurrent Observation:\n{observation}")
+            if reasoning_history:
+                context += "\n\nPrevious ReAct reasoning:\n" + "\n".join(reasoning_history[-6:])
+            record, action = self._step(t, observation, context, library, history,
+                                       use_emotion=use_emotion, collect_emotion=collect_emotion)
+            result = env.step(action)
+            record.reward = float(result.reward)
+            record.next_observation = result.observation
+            record.environment_info = dict(result.info or {})
+            record.done = bool(result.done)
             log.add_step(record)
-            history.append((action, step_result.observation))
-            observation = step_result.observation
-
-            if step_result.done:
-                log.outcome = step_result.reward
-                log.success = step_result.reward >= 1.0
+            if collect_emotion and not use_emotion and self.config.warmup_policy == "react_skill":
+                reasoning_history.append(record.action_raw_output)
+            history.append((action, result.observation))
+            observation = result.observation
+            log.outcome = float(result.reward)
+            log.success = bool(result.success)
+            log.final_info = dict(result.info or {})
+            if verbose:
+                print(f"{episode_id} step={t} skill={record.skill_selected} admitted={record.emotion_used} action={action}")
+            if result.done:
+                log.terminated = True
                 break
-
-        if verbose:
-            print(f"  Episode {episode_id}: outcome={log.outcome:.3f} "
-                  f"{'SUCCESS' if log.success else 'FAILURE'}")
-
+        log.truncated = not log.terminated
         return log
 
-    # ── multi-episode evaluation ───────────────────────────────────────────────
-
-    def run_episodes(
-        self,
-        env,
-        library:         SkillLibrary,
-        n_episodes:      int   = 134,
-        use_emotion:     bool  = True,
-        evolution:       bool  = True,
-        episode_per_round: int = 20,
-        verbose:         bool  = False,
-        format_context_fn=None,
-        reset_kwargs:    Optional[dict] = None,
-    ) -> list[EpisodeLog]:
-        """
-        Run n_episodes episodes with periodic evolution rounds.
-
-        Parameters
-        ----------
-        env               : initialised environment
-        library           : skill library (modified in-place during evolution)
-        n_episodes        : total episodes to run
-        use_emotion       : enable emotion augmentation
-        evolution         : enable skill evolution
-        episode_per_round : batch size between evolution rounds
-        verbose           : print per-step info
-
-        Returns
-        -------
-        all_logs : list of EpisodeLog
-        """
-        all_logs: list[EpisodeLog]        = []
-        current_batch: list[EpisodeLog]   = []
-        round_id = 0
-
-        for ep_idx in range(n_episodes):
-            ep_id = f"ep_{ep_idx:04d}"
-
-            # Reset environment
-            kw = reset_kwargs or {}
-            if hasattr(env, "task_instruction"):
-                # WebShop
-                obs = env.reset(task_idx=ep_idx, **kw)
-                task_goal = env.task_instruction()
-                fmt_fn = lambda tg, h, o: env.format_context(tg, h, o)
-            else:
-                # ALFWorld
-                obs, task_goal = env.reset(**kw)
-                fmt_fn = lambda tg, h, o: env.format_context(tg, h, o)
-
-            if format_context_fn is not None:
-                fmt_fn = format_context_fn
-
-            log = self.run_episode(
-                env            = env,
-                library        = library,
-                episode_id     = ep_id,
-                use_emotion    = use_emotion,
-                verbose        = verbose,
-                format_context_fn = fmt_fn,
-            )
+    def run_episodes(self, env, library: SkillLibrary, n_episodes: int = 134,
+                     use_emotion: bool = True, collect_emotion: Optional[bool] = None,
+                     evolution: bool = False, episode_per_round: int = 50, verbose: bool = False,
+                     format_context_fn=None, reset_kwargs: Optional[dict] = None,
+                     task_order: Optional[list] = None, seed: Optional[int] = None,
+                     run_id: Optional[str] = None, phase: str = "evaluation",
+                     evolution_rounds: Optional[int] = None) -> list[EpisodeLog]:
+        if evolution and phase != "evolution":
+            raise ValueError("Skill updates are permitted only in phase='evolution'; test libraries must be frozen.")
+        if episode_per_round < 1 or n_episodes < 0:
+            raise ValueError("episode_per_round must be positive and n_episodes nonnegative.")
+        rounds_limit = self.config.evolution_rounds if evolution_rounds is None else evolution_rounds
+        if rounds_limit < 0:
+            raise ValueError("evolution_rounds must be nonnegative.")
+        if seed is not None:
+            self.config.seed = seed
+        if run_id is not None:
+            self.run_id = run_id
+        order = list(task_order) if task_order is not None else list(range(n_episodes))
+        if task_order is None:
+            random.Random(self.config.seed).shuffle(order)
+        if len(order) != n_episodes:
+            raise ValueError("task_order must contain exactly n_episodes task identifiers.")
+        self._active_phase, self._active_round = phase, 0
+        self._active_run_path = Path(self.config.log_dir) / self.run_id / f"{phase}_{self._segments:03d}"
+        self._segments += 1
+        self._active_run_path.mkdir(parents=True, exist_ok=False)
+        self._save_library(library, 0)
+        metadata = {"run_id": self.run_id, "seed": self.config.seed, "task_order": order,
+                    "phase": phase, "config": dataclasses.asdict(self.config), "evolution_enabled": evolution,
+                    "backend": getattr(env, "backend", "unknown"), "split": getattr(env, "split", "unknown"),
+                    "checkpoints": self._checkpoint_hashes(), "method": getattr(self, "method_name", "Emotion2Skill")}
+        if callable(getattr(env, "metadata", None)):
+            metadata["environment"] = env.metadata()
+        metadata["baseline"] = getattr(self, "baseline_metadata", None)
+        metadata["model"] = {"name_or_path": self.config.model_name_or_path,
+            "requested_revision": self.config.model_revision,
+            "resolved_revision": getattr(self.llm, "resolved_model_revision", None),
+            "local_identity": getattr(self.llm, "model_identity", None)}
+        metadata["skill_library"] = library.metadata
+        self._write_json(self._active_run_path / "run_metadata.json", metadata)
+        all_logs, batch = [], []
+        for index, task_idx in enumerate(order):
+            kw = dict(reset_kwargs or {})
+            if "task_idx" in kw:
+                raise ValueError("Use task_order to specify task IDs instead of reset_kwargs.task_idx.")
+            observation, goal = env.reset(task_idx=task_idx, **kw)
+            log = self.run_episode(env, library, episode_id=f"ep_{index:04d}", use_emotion=use_emotion,
+                collect_emotion=collect_emotion, verbose=verbose, format_context_fn=format_context_fn,
+                initial_observation=observation, task_goal=goal)
             all_logs.append(log)
-            current_batch.append(log)
-
-            # Evolution round at the end of each batch
-            if evolution and len(current_batch) >= episode_per_round:
-                round_id += 1
-                if verbose:
-                    print(f"\n[Round {round_id}] Running skill evolution…")
-                self.evolver.run_round(library, current_batch, verbose=verbose)
-                self._save_library(library, round_id)
-                current_batch = []
-
-        # Final partial batch
-        if evolution and current_batch:
-            round_id += 1
-            self.evolver.run_round(library, current_batch, verbose=verbose)
-            self._save_library(library, round_id)
-
-        self._save_logs(all_logs)
+            batch.append(log)
+            self._append_log(log)
+            if evolution and len(batch) >= episode_per_round and self._active_round < rounds_limit:
+                self._active_round += 1
+                try:
+                    self.evolver.run_round(library, batch, verbose=verbose)
+                finally:
+                    self._save_evolution_evidence(self._active_round)
+                    self._save_library(library, self._active_round)
+                batch = []
+        if evolution and batch and self._active_round < rounds_limit:
+            self._active_round += 1
+            try:
+                self.evolver.run_round(library, batch, verbose=verbose)
+            finally:
+                self._save_evolution_evidence(self._active_round)
+                self._save_library(library, self._active_round)
         return all_logs
 
-    # ── persistence ───────────────────────────────────────────────────────────
+    def _checkpoint_hashes(self) -> dict:
+        hashes = {}
+        for label, path in (("extractor", self.config.extractor_path), ("encoder", self.config.encoder_path)):
+            if path and Path(path).is_file():
+                digest = hashlib.sha256()
+                with open(path, "rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                hashes[label] = {"path": str(Path(path).resolve()), "sha256": digest.hexdigest()}
+        return hashes
+
+    @staticmethod
+    def _write_json(path: Path, value) -> None:
+        with path.open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, ensure_ascii=False, allow_nan=False)
 
     def _save_library(self, library: SkillLibrary, round_id: int) -> None:
-        path = Path(self.config.log_dir) / f"library_round_{round_id:03d}.json"
-        data = [
-            {"name": s.name, "description": s.description, "sop": s.sop}
-            for s in library.skills
-        ]
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        if self._active_run_path is not None:
+            self._write_json(self._active_run_path / f"library_round_{round_id:03d}.json",
+                             [dataclasses.asdict(skill) for skill in library.skills])
+
+    def _save_evolution_evidence(self, round_id: int) -> None:
+        self._write_json(self._active_run_path / f"evolution_round_{round_id:03d}.json", self.evolver.last_evidence)
+
+    def _append_log(self, log: EpisodeLog) -> None:
+        path = self._active_run_path / "episode_logs.jsonl"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(log.to_dict(), ensure_ascii=False, allow_nan=False) + "\n")
 
     def _save_logs(self, logs: list[EpisodeLog]) -> None:
-        path = Path(self.config.log_dir) / "episode_logs.jsonl"
-        with open(path, "w") as f:
-            for log in logs:
-                record = {
-                    "episode_id": log.episode_id,
-                    "outcome":    log.outcome,
-                    "success":    log.success,
-                    "n_steps":    len(log.steps),
-                    "steps": [
-                        {
-                            "t":             s.step,
-                            "skill":         s.skill_selected,
-                            "confidence":    round(s.confidence, 3),
-                            "template_idx":  s.template_idx,
-                            "action":        s.action_taken[:100],
-                            "reward":        s.reward,
-                        }
-                        for s in log.steps
-                    ],
-                }
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        """Compatibility helper; normal execution persists each episode immediately."""
+        for log in logs:
+            self._append_log(log)

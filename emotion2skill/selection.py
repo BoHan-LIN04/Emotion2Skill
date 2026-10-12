@@ -18,11 +18,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-import torch
-
-from .encoder import EmotionSummary
+if TYPE_CHECKING:
+    from .encoder import EmotionSummary
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,6 +50,7 @@ class SkillLibrary:
     The skill library S = {s_1, ..., s_M}.
     """
     skills: list[Skill] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
     # ── accessors ─────────────────────────────────────────────────────────────
 
@@ -168,15 +168,16 @@ class SelectionResult:
     raw_output:    str
     prompt:        str
     emotion_used:  bool
+    candidate_scores: dict[str, float] = field(default_factory=dict)
 
 
 class SkillSelector:
     """
     Emotion-Augmented Skill Selection (Eq. 9–11).
 
-    Calls the LLM with the augmented prompt and parses the output to
-    identify the chosen skill name.  Falls back to the first skill if
-    parsing fails.
+    Scores every valid identifier by its conditional token log probability.
+    Text-only mock callables must return one exact identifier or menu number;
+    ambiguous output is rejected instead of silently selecting the first skill.
 
     Parameters
     ----------
@@ -202,44 +203,47 @@ class SkillSelector:
         SelectionResult with the chosen skill name and metadata.
         """
         prompt = build_selection_prompt(context, library, emotion)
-        raw    = self._llm(SELECTION_SYSTEM, prompt).strip()
-
-        # Parse: find first matching skill name in model output
-        skill_name = self._parse_skill(raw, library)
+        names = library.names()
+        if not names:
+            raise ValueError("Cannot select from an empty skill library.")
+        scores: dict[str, float] = {}
+        if callable(getattr(self._llm, "score_candidates", None)):
+            values = self._llm.score_candidates(SELECTION_SYSTEM, prompt, names)
+            scores = dict(values) if isinstance(values, dict) else dict(zip(names, values))
+            if set(scores) != set(names):
+                raise ValueError("Candidate scorer must return one score per valid skill.")
+            import math
+            if any(not math.isfinite(float(value)) for value in scores.values()):
+                raise ValueError("Candidate scorer returned a non-finite score.")
+            skill_name = max(names, key=lambda name: float(scores[name]))
+            raw = skill_name
+        else:
+            raw = self._llm(SELECTION_SYSTEM, prompt).strip()
+            skill_name = self._parse_skill(raw, library)
 
         return SelectionResult(
             skill_name   = skill_name,
             raw_output   = raw,
             prompt       = prompt,
             emotion_used = emotion is not None and emotion.is_admitted,
+            candidate_scores = scores,
         )
 
     @staticmethod
     def _parse_skill(text: str, library: SkillLibrary) -> str:
         """
         Extract the skill name from model output.
-        Tries exact match, then case-insensitive, then partial substring.
-        Falls back to the first skill if nothing matches.
+        Accept an entire exact skill name (case-insensitive) or a 1-based
+        menu number. Never interpret a mention in explanatory prose as a vote.
         """
         names = library.names()
 
-        # 1. Exact match anywhere in the output
+        answer = text.strip().strip('"\'').strip()
+        if re.fullmatch(r"\d+", answer):
+            index = int(answer) - 1
+            if 0 <= index < len(names):
+                return names[index]
         for name in names:
-            if name in text:
+            if answer.casefold() == name.casefold():
                 return name
-
-        # 2. Case-insensitive
-        text_lower = text.lower()
-        for name in names:
-            if name.lower() in text_lower:
-                return name
-
-        # 3. Partial word match (e.g. "product" → "ProductSearch")
-        words = re.findall(r"\w+", text_lower)
-        for word in words:
-            for name in names:
-                if word in name.lower() and len(word) >= 4:
-                    return name
-
-        # Fallback
-        return names[0]
+        raise ValueError(f"Invalid skill selection {text!r}; expected one of {names} or its menu number.")

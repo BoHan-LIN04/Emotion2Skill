@@ -8,13 +8,22 @@ Defines the initial skill libraries for all four benchmarks:
   - MBPP     (5 skills, §A.2)
 
 Each skill has a name, a one-line description, and a full SOP.
-SOPs are distilled from MASA training traces (WebShop/ALFWorld) or
-from standard problem-solving strategies (MATH/MBPP).
+These are hand-authored executable initializations. Their equality to the
+historical manuscript experiment libraries has not been established; load
+archived libraries explicitly when reproducing those results.
 """
 
 from __future__ import annotations
 
 from emotion2skill.selection import Skill, SkillLibrary
+
+INITIAL_LIBRARY_METADATA = {"source_type": "hand_authored",
+    "historical_experiment_equivalence": "unverified", "schema_version": 1}
+
+
+def _copy_library(skills):
+    return SkillLibrary([Skill(item.name, item.sop, item.description) for item in skills],
+                        metadata=dict(INITIAL_LIBRARY_METADATA))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,13 +134,13 @@ Steps:
         name="CartManage",
         description="Add the selected product to the cart and verify the cart state.",
         sop="""\
-Trigger: All options are set; product is ready to be added to cart.
+Trigger: A preferred product and its required options have been selected.
 Steps:
-  1. Click the "Add to Cart" button.
-  2. Navigate to the cart view.
-  3. Verify: correct product name, quantity, price, and options displayed.
-  4. If cart contains an incorrect item, remove it and restart from OptionSelect.
-  5. Exit condition: cart contains exactly the required product with correct attributes.
+  1. Remain on the chosen product page; WebShop has no separate cart workflow.
+  2. Verify the selected size, color, quantity and displayed price against the task.
+  3. If an option is wrong, click its displayed option label to correct it.
+  4. If the product is unsuitable, use a displayed navigation button and compare alternatives.
+  5. Exit condition: all required options and product constraints are verified.
 """,
     ),
 
@@ -139,21 +148,19 @@ Steps:
         name="PurchaseConfirm",
         description="Confirm all task constraints are met and execute the purchase.",
         sop="""\
-Trigger: Cart is verified; ready to complete purchase.
+Trigger: A product is selected and all required options are verified.
 Steps:
-  1. Review the full task goal one final time.
-  2. Check cart: product name, price ≤ budget, all required attributes present.
-  3. If any constraint is violated, abort and return to the relevant earlier skill.
-  4. Click "Buy Now" / "Confirm Purchase".
-  5. Record the final reward signal.
-  6. Exit condition: purchase confirmed and episode ends.
+  1. Re-read the complete task goal and check product identity, price and attributes.
+  2. Correct a mismatched option or choose another product before purchasing.
+  3. When every constraint is met, execute click[buy now] using the displayed button label.
+  4. Exit condition: the environment terminates and supplies the final reward.
 """,
     ),
 ]
 
 
 def get_webshop_library() -> SkillLibrary:
-    return SkillLibrary(skills=list(WEBSHOP_SKILLS))
+    return _copy_library(WEBSHOP_SKILLS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,18 +173,15 @@ ALFWORLD_SKILLS: list[Skill] = [
         name="PickObject",
         description="Navigate to an object and pick it up.",
         sop="""\
-Trigger: Task requires picking up an object and placing it somewhere.
+Trigger: Pick one target object and place it at the requested destination.
 Steps:
-  1. Identify the target object from the task description.
-  2. Navigate to the most likely receptacle locations in priority order
-     (check visible surfaces first, then open containers).
-  3. If the object is visible, execute 'pick up <object>'.
-  4. If not found after checking 3 locations, expand search systematically
-     (open drawers, check cabinets).
-  5. Confirm pick-up succeeded (object now in inventory).
-  6. Navigate to the destination and place the object.
-  7. Exit condition: object placed at the correct destination.
-Recovery: If 'pick up' fails due to blocked path, move closer and retry.
+  1. Read the full task goal and locate likely receptacles with go to <receptacle N>.
+  2. Inspect visible objects; open <container N> when necessary.
+  3. Execute take <object N> from <receptacle N> using observed instance identifiers.
+  4. Confirm the object is in inventory, then navigate to the task destination.
+  5. Execute put <object N> in/on <destination N>.
+  6. Exit condition: the goal placement is confirmed.
+Recovery: Follow environment feedback and admissible action syntax; retry only after fixing the failed precondition.
 """,
     ),
 
@@ -185,16 +189,13 @@ Recovery: If 'pick up' fails due to blocked path, move closer and retry.
         name="LookObject",
         description="Examine an object under a light source or in a specific location.",
         sop="""\
-Trigger: Task requires examining an object under a lamp or in a lit area.
+Trigger: Examine the target object with a lamp as specified by the task.
 Steps:
-  1. Locate the target object using the same search procedure as PickObject.
-  2. Pick up the object.
-  3. Identify the nearest desk lamp or floor lamp.
-  4. Navigate to the lamp and turn it on if it is off.
-  5. Stand adjacent to the lamp and examine the object ('examine <object>
-     under <lamp>').
-  6. Exit condition: examination action confirmed.
-Recovery: If no lamp is found, use the overhead light receptacle.
+  1. Locate the object and take <object N> from <receptacle N>.
+  2. Locate and go to the required lamp or its receptacle.
+  3. While carrying the object, use <desklamp N> or use <floorlamp N> as available.
+  4. Exit condition: the environment confirms the examination goal.
+Recovery: Use only observed object and lamp identifiers; do not invent an examine-under command.
 """,
     ),
 
@@ -202,16 +203,15 @@ Recovery: If no lamp is found, use the overhead light receptacle.
         name="CleanObject",
         description="Pick up an object, clean it in a sink, and place it at the target.",
         sop="""\
-Trigger: Task requires cleaning an object.
+Trigger: Clean a target object and place it at the requested destination.
 Steps:
-  1. Locate and pick up the target object.
-  2. Navigate to the sink.
-  3. Place the object in the sink.
-  4. Turn the tap on ('use faucet on <object>').
-  5. Pick up the cleaned object.
-  6. Navigate to the destination and place it.
-  7. Exit condition: cleaned object placed at the target location.
-Recovery: If the sink is occupied, remove the blocking item first.
+  1. Locate and take <object N> from <receptacle N>.
+  2. Go to the observed sinkbasin while keeping the object in inventory.
+  3. Execute clean <object N> with <sinkbasin N>.
+  4. Confirm the cleaning result, then go to the destination.
+  5. Execute put <object N> in/on <destination N>.
+  6. Exit condition: the cleaned object is placed correctly.
+Recovery: Inspect the environment feedback and repair the missing precondition before retrying.
 """,
     ),
 
@@ -219,19 +219,15 @@ Recovery: If the sink is occupied, remove the blocking item first.
         name="HeatObject",
         description="Pick up an object, heat it in a microwave, and place it at the target.",
         sop="""\
-Trigger: Task requires heating an object.
+Trigger: Heat a target object and place it at the requested destination.
 Steps:
-  1. Locate and pick up the target object.
-  2. Navigate to the microwave.
-  3. Open the microwave door.
-  4. Place the object inside.
-  5. Close the door and turn the microwave on.
-  6. Wait for the heating cycle, then open the door.
-  7. Pick up the heated object (it may be described as "hot").
-  8. Navigate to the destination and place it.
-  9. Exit condition: heated object at the target location.
-Recovery: If the microwave is already running, wait one step then open.
-          If object is too large, check for oven as an alternative.
+  1. Locate and take <object N> from <receptacle N>.
+  2. Go to the observed microwave; inspect its state and open it when required.
+  3. Execute heat <object N> with <microwave N> using the supported environment command.
+  4. Confirm the heating result and retain the object in inventory.
+  5. Go to the destination and put <object N> in/on <destination N>.
+  6. Exit condition: the heated object is placed correctly.
+Recovery: Use observed feedback and admissible commands; do not simulate waits or appliance cycles not supported by the environment.
 """,
     ),
 
@@ -239,17 +235,15 @@ Recovery: If the microwave is already running, wait one step then open.
         name="CoolObject",
         description="Pick up an object, cool it in the fridge, and place it at the target.",
         sop="""\
-Trigger: Task requires cooling an object.
+Trigger: Cool a target object and place it at the requested destination.
 Steps:
-  1. Locate and pick up the target object.
-  2. Navigate to the fridge/refrigerator.
-  3. Open the fridge door.
-  4. Place the object inside.
-  5. Close the door and wait one step.
-  6. Open the fridge and pick up the cooled object.
-  7. Navigate to the destination and place it.
-  8. Exit condition: cooled object at the target location.
-Recovery: If fridge is full, remove one item temporarily.
+  1. Locate and take <object N> from <receptacle N>.
+  2. Go to the observed fridge and open it when required by the environment.
+  3. Execute cool <object N> with <fridge N>.
+  4. Confirm the cooling result, then go to the destination.
+  5. Execute put <object N> in/on <destination N>.
+  6. Exit condition: the cooled object is placed correctly.
+Recovery: Repair the precondition identified by the environment feedback before retrying.
 """,
     ),
 
@@ -257,27 +251,22 @@ Recovery: If fridge is full, remove one item temporarily.
         name="PickTwoObjects",
         description="Pick up two instances of an object and place both at the target.",
         sop="""\
-Trigger: Task requires delivering two objects of the same type.
+Trigger: Place two distinct instances of the requested object at the destination.
 Steps:
-  1. Locate the first instance of the target object.
-  2. Pick it up and carry it to a temporary staging location near the destination.
-  3. Place the first object at the staging area.
-  4. Locate the second instance (check remaining receptacles).
-  5. Pick up the second object.
-  6. Navigate to the final destination.
-  7. Place the second object at the destination.
-  8. Return for the first object and place it at the destination.
-  9. Exit condition: both objects placed at the destination.
-Note: The agent can only carry one object at a time; staging is required.
-Recovery: If a second instance cannot be found after checking all rooms,
-          re-examine containers that were only partially inspected.
+  1. Locate the first instance and take <object N> from <receptacle N>.
+  2. Carry it to the final destination and put <object N> in/on <destination N>.
+  3. Record the placed instance ID to avoid selecting it again.
+  4. Locate a second distinct instance and take it from its receptacle.
+  5. Carry the second instance to the same destination and put it there.
+  6. Exit condition: both distinct instances have the required placement.
+Recovery: The agent carries one object at a time; place the first before taking the second.
 """,
     ),
 ]
 
 
 def get_alfworld_library() -> SkillLibrary:
-    return SkillLibrary(skills=list(ALFWORLD_SKILLS))
+    return _copy_library(ALFWORLD_SKILLS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -373,7 +362,7 @@ Steps:
 
 
 def get_math_library() -> SkillLibrary:
-    return SkillLibrary(skills=list(MATH_SKILLS))
+    return _copy_library(MATH_SKILLS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -465,7 +454,7 @@ Steps:
 
 
 def get_mbpp_library() -> SkillLibrary:
-    return SkillLibrary(skills=list(MBPP_SKILLS))
+    return _copy_library(MBPP_SKILLS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

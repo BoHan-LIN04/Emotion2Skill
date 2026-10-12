@@ -1,268 +1,145 @@
 # Emotion2Skill
 
-**Grounding Agent Skill Selection in LLM-Internal Emotion Vectors**
+**LLM-Internal Emotion Signals for Adaptive Skill Selection and Evolution**
 
-AAAI 2027 (under review)
+Emotion2Skill extracts 27-dimensional internal emotion features from Qwen3, maps them to a learned confidence-gated routing summary, and uses trajectory transitions to rewrite skill SOPs. The released implementation follows the supplied AAAI 2027 manuscript protocol.
 
----
+## Reported manuscript results
 
-## Overview
+These values are reported in the supplied manuscript. They are not measurements produced by the software repair or by the CPU regression tests.
 
-Emotion2Skill is an agent framework that extracts **emotion vectors** directly from a Qwen3 model's residual stream and uses them to improve skill selection and skill evolution—without any external emotion classifier or fine-tuning of the backbone model.
+| Backbone | ALFWorld Avg. (%) | WebShop Score | WebShop Succ. (%) |
+|---|---:|---:|---:|
+| Qwen3-8B | 53.1 ± 1.6 | 64.7 | 33.3 ± 0.6 |
+| Qwen3-14B | 57.0 ± 1.6 | 66.8 | 37.0 ± 0.6 |
 
-Three named contributions:
-
-| Component | Role |
-|-----------|------|
-| **Emotion Vectors** | Contrastive directions extracted offline from the residual stream at layer L* |
-| **Emotion-Augmented Skill Selection** | Confidence-gated emotion summary injected into the routing prompt |
-| **Emotion-Driven Skill Evolution** | Transition-point diagnostics used to localise and rewrite underperforming SOPs |
-
-### Key results (Qwen3-8B)
-
-| Benchmark | Metric | Zero-Shot | MASA | **Emotion2Skill** |
-|-----------|--------|-----------|------|-------------------|
-| ALFWorld  | Avg.%  | 21.9      | 43.3 | **47.4 ± 1.6**    |
-| WebShop   | Succ.% | 2.8       | 27.1 | **29.7 ± 1.6**    |
-| MATH      | Acc.%  | 54.8      | —    | **69.2** (+14.4 pp) |
-| MBPP      | Pass@1 | 60.0      | —    | **71.8** (+11.8 pp) |
-
----
-
-## Repository Structure
-
-```
-emotion2skill/
-├── emotion2skill/              # Main package
-│   ├── extraction.py           # §3.2 — Emotion vector extraction (W_e, L*)
-│   ├── encoder.py              # §3.2 — Emotion encoder f_θ (MLP + losses)
-│   ├── selection.py            # §3.3 — Emotion-augmented skill selection
-│   ├── evolution.py            # §3.4 — Emotion-driven skill evolution
-│   ├── agent.py                # Algorithm 1 — full agent loop
-│   ├── skills/
-│   │   └── __init__.py         # Skill libraries (WebShop, ALFWorld, MATH, MBPP)
-│   └── envs/
-│       ├── webshop.py          # WebShop environment wrapper
-│       └── alfworld.py         # ALFWorld environment wrapper
-├── train_encoder.py            # Encoder warm-up training script
-├── evaluate.py                 # Full evaluation + ablation script
-├── scripts/
-│   ├── run_webshop_8b.sh       # End-to-end WebShop pipeline
-│   ├── run_alfworld_8b.sh      # End-to-end ALFWorld pipeline
-│   ├── run_ablations.sh        # Table 2 ablation sweep
-│   └── run_tau_sweep.sh        # τ sensitivity sweep
-├── configs/
-│   ├── default.yaml            # Qwen3-8B default config
-│   └── qwen3_14b.yaml          # Qwen3-14B overrides
-├── tests/
-│   └── test_core.py            # Unit tests (pytest)
-├── data/
-│   ├── emotion_stories/        # Generated stories (auto-built)
-│   └── goemotions/             # GoEmotions test split (JSON)
-├── requirements.txt
-└── setup.py
-```
-
----
+The manuscript additionally reports 69.2% MATH accuracy on 500 problems and 71.8% MBPP pass@1 on 374 tasks. Original task manifests, checkpoints, corpus, baseline implementations and per-run traces have not been supplied with this release; their status is recorded in [artifacts.json](artifacts.json). Newly generated assets do not establish identity with the original runs.
 
 ## Installation
 
-```bash
-git clone <repo-url>
-cd emotion2skill
-pip install -e ".[dev]"
-```
-
-### Install benchmark environments
-
-**WebShop:**
-```bash
-git clone https://github.com/princeton-nlp/WebShop
-cd WebShop && pip install -e .
-```
-
-**ALFWorld:**
-```bash
-pip install alfworld
-alfworld-download
-export ALFWORLD_DATA=/path/to/alfworld/data
-```
-
----
-
-## Quick Start
-
-### 1. Build the emotion extractor (offline, one-time)
-
-```python
-from emotion2skill.extraction import EmotionExtractor
-
-ext = EmotionExtractor("Qwen/Qwen3-8B", model_key="qwen3-8b", device="cuda")
-ext.build(
-    stories_path         = "data/emotion_stories/stories.json",
-    goemotions_test_path = "data/goemotions/test.json",
-    save_path            = "checkpoints/extractor_qwen3_8b.pkl",
-)
-# Prints selected L* (should be 24) and GoEmotions accuracy (37.2%)
-```
-
-### 2. Train the emotion encoder
+Use Python 3.10 or newer; CPU regressions were checked with Python 3.11.
 
 ```bash
-python train_encoder.py \
-    --model   Qwen/Qwen3-8B \
-    --env     webshop \
-    --warmup  50 \
-    --epochs  30 \
-    --extractor checkpoints/extractor_qwen3_8b.pkl \
-    --out     checkpoints/encoder_webshop_8b.pt
+git clone https://github.com/BoHan-LIN04/Emotion2Skill.git
+cd Emotion2Skill
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev,analysis,data]'
+pytest tests/ -q
 ```
 
-### 3. Evaluate
+[requirements-tested.txt](requirements-tested.txt) records the direct dependency versions tested on macOS arm64. It is a CPU verification environment, not a recovered original H800 environment. Transformers must be at least 4.51 for Qwen3; the implementation currently targets its 4.x API.
+
+For WebShop, follow the [official setup](https://github.com/princeton-nlp/WebShop#-setup), including product/goal data, the spaCy model and search index; record the exact upstream revision and product-pool settings. For ALFWorld, install its official package and download the data with `alfworld-download`. Set `datasets.alfworld.data_path` in the YAML to the downloaded root. The wrappers use the official APIs and stop if a real environment cannot initialize.
+
+MBPP executes generated code in a separate process with a timeout and resource limits. These limits are not an operating-system sandbox. Run formal MBPP evaluation inside a dedicated container or VM with no credentials or network access.
+
+## Prepare fixed datasets
+
+Fetch and convert the official GoEmotions snapshot used in the preparation check:
 
 ```bash
-python evaluate.py \
-    --model     Qwen/Qwen3-8B \
-    --env       webshop \
-    --extractor checkpoints/extractor_qwen3_8b.pkl \
-    --encoder   checkpoints/encoder_webshop_8b.pt \
-    --tau       0.3 \
-    --evolution \
-    --n_runs    3
+python scripts/prepare_goemotions.py --download \
+  --revision 5b381db4139c3cbf25cc9a698c5fe9754215fae2
 ```
 
-Or use the end-to-end script (runs Steps 1–3 automatically):
+The preparation script removes the neutral label, excludes neutral-only examples, preserves original example IDs, checks split overlap, and records source revision and SHA256. The snapshot produces 3,834 validation and 3,821 test examples. Layer selection reads validation only; fixed-layer test evaluation is separate.
+
+Benchmark manifests must identify the actual train/dev/test tasks and dataset revision. The preparation tool preserves supplied splits and never invents a replacement test subset:
 
 ```bash
-bash scripts/run_webshop_8b.sh 0,1   # GPU IDs
+python scripts/prepare_benchmarks.py --benchmark webshop \
+  --source data/webshop_splits.json --dataset-revision SOURCE_COMMIT \
+  --output manifests/webshop.json
+python scripts/prepare_benchmarks.py --benchmark alfworld \
+  --source data/alfworld --dataset-revision DATASET_REVISION \
+  --output manifests/alfworld.json
+```
+
+WebShop source JSON contains `train`, `dev`, `test` lists of canonical goal indices and optional `environment` settings for the exact product pool. ALFWorld preparation reads solvable official `json_2.1.1` games under train/valid_seen/valid_unseen and retains relative gamefile paths and hashes. MATH/MBPP source JSON contains explicit split lists of original records: a canonical `task_id`/`id`, MATH `problem` and `answer`/`solution`, or MBPP `text` and `test_list`. Use the same preparation command with `--benchmark math` or `mbpp` and an appropriate source/output. Preserve the original paper task lists when reproducing its numbers.
+
+## Build extractor and shared encoder
+
+```bash
+python scripts/build_extractor.py --config configs/default.yaml
+python train_encoder.py --config configs/default.yaml --env mixed
+```
+
+The story builder varies explicit scenarios under greedy decoding, applies sentence-count and target-top-3 classification filters, rejects embedding cosine duplicates above 0.95, and requires exactly 100 passing stories per concept. Failed builds retain resumable evidence and cannot become a valid extractor. The 14B extractor uses the completed canonical Qwen3-8B corpus.
+
+Extraction uses prefix exclusion at token 50, top-10 neutral PCA components from 100 neutral stories, and validation-only layer selection. Online features come from the final token of the real non-thinking chat generation prefix. Model and dataset provenance are retained with the extractor.
+
+Warm-up runs a text-only ReAct skill policy while still recording real emotion vectors. The default uses 250 training episodes per benchmark, filters low-signal steps, and trains one encoder per backbone for reuse across all four benchmarks. Training uses AdamW, lr 0.001, weight decay 0.0001, batch 64, up to 50 epochs and patience 5 on an episode-disjoint validation subset. The objective combines contrastive loss, prototype classification (weight 0.5), and success-label confidence BCE (weight 1). Cluster-to-template semantic mappings, the canonical 12-template bank and source hashes are stored in the checkpoint.
+
+## Run main experiments
+
+```bash
+bash scripts/run_webshop_8b.sh 0,1
 bash scripts/run_alfworld_8b.sh 0,1
+bash scripts/run_qwen3_14b.sh webshop 0,1
+python evaluate.py --config configs/default.yaml --env math --no-evolution
+python evaluate.py --config configs/default.yaml --env mbpp --no-evolution
 ```
 
-### 4. Ablations (Table 2)
+Each evolution round uses 50 distinct WebShop and 50 distinct ALFWorld training tasks, sharing the encoder and keeping separate libraries. The default is three rounds with underperformance threshold 0.4. Warm-up/evolution/test IDs and checkpoint source metadata are checked for overlap; final test libraries are frozen. The rewriter uses real transition windows, LLM diagnostics, and a 200-word SOP limit. Long diagnostics are processed in budgeted batches while preserving the complete source windows and generated summaries.
+
+YAML configuration is actually loaded; CLI options override it. The 14B YAML inherits the base protocol and sets matching model, extractor and encoder identities. Three runs use the same task subset in distinct recorded orders. Run directories retain effective config, task order, seed, backend, checkpoint hashes, complete observations/actions/emotion states, grading results, and initial/evolved SOP snapshots. Reported uncertainty uses sample standard deviation.
+
+## Ablations and analysis
 
 ```bash
 bash scripts/run_ablations.sh 0,1
 bash scripts/run_tau_sweep.sh 0,1
+bash scripts/run_round_analysis.sh 0,1
 ```
 
----
-
-## Method Summary
-
-### Emotion Vector Extraction (§3.2, Eq. 1–3)
-
-For each of K=27 GoEmotions concepts, we generate N=100 short stories with Qwen3 and record residual-stream activations at layer ℓ.  The contrastive direction for concept k is:
-
-```
-v_k^(ℓ) = (1/N) Σ_n h̄_{k,n}^(ℓ)  −  (1/KN) Σ_{k',n} h̄_{k',n}^(ℓ)
-```
-
-PCA-based denoising projects out the top 5 neutral principal components.  The optimal layer L* is selected by maximising GoEmotions 27-class accuracy.  For Qwen3-8B, L*=24 (accuracy 37.2%; random baseline 8.2%).
-
-At inference, the emotion state is:
-
-```
-e_t = W_e h_T^(L*) / ‖W_e h_T^(L*)‖₂  ∈ R^K
-```
-
-### Emotion Encoder f_θ (§3.2, Eq. 4–8)
-
-A 3-layer MLP (K → 64 → 128 → 128, <27K parameters) maps e_t to:
-- **Template index** T_t* (Eq. 4): cosine similarity over 12 learnable prototypes
-- **Confidence** c_t ∈ (0,1) (Eq. 5): sigmoid head
-
-Training loss (Eq. 8):  `L = L_ctr + λ * L_cls`
-- `L_ctr`: supervised contrastive (positives = same skill ∧ successful episode)
-- `L_cls`: cross-entropy over k-means pseudo-labels (k=12)
-
-### Emotion-Augmented Skill Selection (§3.3, Eq. 9–11)
-
-```
-P_t = [x_t; {D_i}; T_t*; c_t]   if c_t ≥ τ
-      [x_t; {D_i}]               otherwise
-```
-
-Setting τ=1 recovers standard text-only selection.
-
-### Emotion-Driven Skill Evolution (§3.4, Eq. 12–17)
-
-Step-to-step emotion shift:
-```
-δ_t = 1 − cosine_similarity(e_t, e_{t−1})
-```
-
-Transition points where δ_t > δ̄ + σ_δ are used to extract 3-step diagnostic windows d_t.  The rewriter prompt includes the current SOP, diagnostics, and episode outcome.
-
----
-
-## Hyper-parameters
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| K | 27 | GoEmotions emotion dimensions |
-| C | 12 | Emotion template slots |
-| d' | 128 | Encoder output dimension |
-| L* (8B) | 24 | Optimal extraction layer (Qwen3-8B) |
-| L* (14B) | 26 | Optimal extraction layer (Qwen3-14B) |
-| τ | 0.3 | Confidence gate threshold |
-| κ | 0.07 | Contrastive temperature |
-| κ' | 0.10 | Classification temperature |
-| λ | 0.5 | L_cls weight |
-| η | 0.5 | Underperformance threshold for evolution |
-| N_warmup | 50 | Warm-up episodes for encoder training |
-
----
-
-## Skill Libraries
-
-| Benchmark | Skills | Notes |
-|-----------|--------|-------|
-| WebShop | 8 | ProductSearch, QueryRephrase, ProductCompare, PriceCompare, ReviewAnalysis, OptionSelect, CartManage, PurchaseConfirm |
-| ALFWorld | 6 | PickObject, LookObject, CleanObject, HeatObject, CoolObject, PickTwoObjects |
-| MATH | 6 | DirectSolve, AlgebraManip, Decompose, Casework, GeomVisualize, VerifyCheck |
-| MBPP | 5 | DirectImplement, DecomposeGuard, BruteForceOptimize, PatternRecognize, TestDriven |
-
----
-
-## Tests
+The ablations separately replace contrastive directions with plain class means, bypass the encoder with top-3 labels, disable evolution, or use outcome-only rewriting. Generic PCA-27 is fitted on training activations; Shuffled Emotion breaks training feature/context pairings. Control encoders are retrained and validated against their extractor mode and shuffle metadata. Threshold selection uses dev tasks, while individually specified test settings support the manuscript sensitivity table.
 
 ```bash
-pytest tests/ -v
+python scripts/analyze_results.py --logs results/RUN/.../episodes.jsonl \
+  --out results/analysis.json --figures results/figures
+python scripts/export_activations.py --config configs/default.yaml \
+  --split test --layer 24 --out results/probe_layer24.npz
+python scripts/analyze_results.py --probe_files results/probe_layer24.npz \
+  --out results/probe_analysis.json --figures results/figures
 ```
 
-All tests run on CPU and do not require Qwen3 to be downloaded.
+Analysis reads actual traces/activations. It supports co-activation, confidence histograms, case trajectories, held-out round curves, t-SNE/Fisher probes, MATH/MBPP comparisons, task-cluster bootstrap intervals and paired permutation tests. Baseline/candidate comparisons require matching task and run IDs. Test is the default analysis partition; dev analysis requires explicit `--split dev` and is marked ineligible for paper test metrics. Synthetic runs cannot enter either analysis or paper aggregation.
 
----
+Use `--annotation_events` to export 200 sampled events for model/human annotation, then pass supplied boolean judgments and human annotations via `--judgments` and `--human_annotations`. Coherence rates and Cohen's kappa are computed from these files, never inserted as assumed values. The local manuscript figure generator only produces schematics without data; empirical plots require measured inputs.
 
-## Reproducing Paper Results
+## Baselines
 
-All experiments use **Qwen3-8B / Qwen3-14B in non-thinking mode, greedy decoding, 2×H800 GPUs**.
+ZeroShot, ReAct, Reflexion and ExpeL have explicit manuscript-protocol runners. ZeroShot sees no skill SOPs; ReAct preserves Thought/Action history; Reflexion performs actual failed-task reflection with a recorded retry budget. ExpeL requires 50 disjoint recorded training experiences and real offline insight extraction before top-5 BM25 retrieval:
 
-| Script | Reproduces |
-|--------|-----------|
-| `scripts/run_webshop_8b.sh` | Table 1, Qwen3-8B WebShop row |
-| `scripts/run_alfworld_8b.sh` | Table 1, Qwen3-8B ALFWorld row |
-| `scripts/run_ablations.sh` | Table 2 ablation rows |
-| `scripts/run_tau_sweep.sh` | Table 2 τ sensitivity section |
-
-Replace `Qwen/Qwen3-8B` with `Qwen/Qwen3-14B` and use `configs/qwen3_14b.yaml` for 14B results.
-
----
-
-## Citation
-
-```bibtex
-@inproceedings{emotion2skill2027,
-  title     = {Emotion2Skill: Grounding Agent Skill Selection in
-               LLM-Internal Emotion Vectors},
-  booktitle = {Proceedings of the 41st AAAI Conference on Artificial Intelligence},
-  year      = {2027},
-}
+```bash
+python -m emotion2skill.baselines build-memory --logs TRAIN_EPISODES.jsonl \
+  --out checkpoints/expel_memory.json --model Qwen/Qwen3-8B --device cuda
+python evaluate.py --method ExpeL --baseline_artifact checkpoints/expel_memory.json
 ```
 
----
+These are manuscript-protocol adaptations, not a claim to reproduce every detail of upstream algorithms. `TextSimilarity` is a separately named lexical skill baseline. It is not labeled MASA.
 
-## License
+MASA, EvoSkill (the manuscript cites AlignEvoSkill) and Trace2Skill require a genuine upstream implementation and source-pinned artifact manifest:
 
-This code is released under the **MIT License**.  
-The Emotion Stories dataset is released under **CC BY 4.0**.
+```bash
+python evaluate.py --method MASA --external_adapter package.module:factory \
+  --baseline_artifact artifacts/masa_manifest.json
+```
+
+The manifest must contain `method`, the cited primary `source_url`, exact `revision`, `benchmark`, `source_split: train`, `source_task_ids`, `protocol_config`, and nonempty `implementation_files` / `artifacts` lists of `{path, sha256}`. The actual factory source must be hash-covered and return the shared runner interface and matching method/revision metadata. Missing integrations fail explicitly. Their original implementations and experimental assets are not bundled here.
+
+Primary sources: [ReAct](https://arxiv.org/abs/2210.03629), [Reflexion](https://github.com/noahshinn/reflexion), [ExpeL](https://github.com/LeapLabTHU/ExpeL), [MASA](https://arxiv.org/abs/2605.30723), [AlignEvoSkill](https://arxiv.org/abs/2506.23149), [Trace2Skill](https://arxiv.org/abs/2603.25158).
+
+## Tests and smoke runs
+
+```bash
+pytest tests/ -q
+python evaluate.py --env webshop --mock --n_episodes 2 --n_runs 1 --no-evolution
+```
+
+The regression suite checks actual data flow, confidence updates, checkpoint compatibility, split isolation, official adapter interfaces, mathematical/code grading, evolution budgets, provenance and analysis. Explicit mock runs test plumbing and are labeled synthetic; their scores are not benchmark results. CI runs the CPU regression suite.
+
+## License and citation
+
+Code is distributed under the [MIT License](LICENSE). Project-generated Emotion Stories use [CC BY 4.0](data/LICENSE); third-party datasets retain their own licenses. [CITATION.cff](CITATION.cff) describes this software release. The supplied manuscript is under review; this repository does not assert an accepted AAAI publication.
