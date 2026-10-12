@@ -129,7 +129,7 @@ python evaluate.py --method MASA --external_adapter package.module:factory \
 
 The manifest must contain `method`, the cited primary `source_url`, exact `revision`, `benchmark`, `source_split: train`, `source_task_ids`, `protocol_config`, and nonempty `implementation_files` / `artifacts` lists of `{path, sha256}`. The actual factory source must be hash-covered and return the shared runner interface and matching method/revision metadata. Missing integrations fail explicitly. Their original implementations and experimental assets are not bundled here.
 
-Primary sources: [ReAct](https://arxiv.org/abs/2210.03629), [Reflexion](https://github.com/noahshinn/reflexion), [ExpeL](https://github.com/LeapLabTHU/ExpeL), [MASA](https://arxiv.org/abs/2605.30723), [AlignEvoSkill](https://arxiv.org/abs/2506.23149), [Trace2Skill](https://arxiv.org/abs/2603.25158).
+Primary sources: [ReAct](https://arxiv.org/abs/2210.03629), [Reflexion](https://github.com/noahshinn/reflexion), [ExpeL](https://github.com/LeapLabTHU/ExpeL), [MASA](https://arxiv.org/abs/2605.30723), [AlignEvoSkill v2](https://arxiv.org/abs/2506.23149v2), [Trace2Skill](https://arxiv.org/abs/2603.25158). AlignEvoSkill manifests must cite v2: the same arXiv identifier's v1 describes V-SYNTHESIS. Official upstream code is available for [MASA](https://github.com/jianxiangyu/MASA_) and [Trace2Skill](https://github.com/Qwen-Applications/Trace2Skill); connecting these sources to this benchmark protocol still requires a validated adapter and original training artifacts.
 
 ## Tests and smoke runs
 

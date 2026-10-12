@@ -28,7 +28,7 @@ PRIMARY_SOURCES = {
     "Reflexion": "https://arxiv.org/abs/2303.11366",
     "ExpeL": "https://arxiv.org/abs/2308.10144",
     "MASA": "https://arxiv.org/abs/2605.30723",
-    "EvoSkill": "https://arxiv.org/abs/2506.23149",
+    "EvoSkill": "https://arxiv.org/abs/2506.23149v2",
     "Trace2Skill": "https://arxiv.org/abs/2603.25158",
     "TextSimilarity": None,
 }
