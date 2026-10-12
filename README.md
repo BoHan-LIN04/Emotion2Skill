@@ -2,7 +2,7 @@
 
 **LLM-Internal Emotion Signals for Adaptive Skill Selection and Evolution**
 
-Emotion2Skill extracts 27-dimensional internal emotion features from Qwen3, maps them to a learned confidence-gated routing summary, and uses trajectory transitions to rewrite skill SOPs. The released implementation follows the supplied AAAI 2027 manuscript protocol.
+Emotion2Skill extracts 27-dimensional internal emotion features from Qwen3, maps them to a learned confidence-gated routing summary, and uses trajectory transitions to rewrite skill SOPs. The released implementation follows the supplied manuscript protocol.
 
 ## Reported manuscript results
 
@@ -142,4 +142,4 @@ The regression suite checks actual data flow, confidence updates, checkpoint com
 
 ## License and citation
 
-Code is distributed under the [MIT License](LICENSE). Project-generated Emotion Stories use [CC BY 4.0](data/LICENSE); third-party datasets retain their own licenses. [CITATION.cff](CITATION.cff) describes this software release. The supplied manuscript is under review; this repository does not assert an accepted AAAI publication.
+Code is distributed under the [MIT License](LICENSE). Project-generated Emotion Stories use [CC BY 4.0](data/LICENSE); third-party datasets retain their own licenses. [CITATION.cff](CITATION.cff) describes this software release.
