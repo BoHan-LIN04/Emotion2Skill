@@ -1,4 +1,4 @@
-"""Content identity for local backbone and tokenizer assets."""
+"""Hash local model and tokenizer assets."""
 import hashlib
 import json
 from pathlib import Path

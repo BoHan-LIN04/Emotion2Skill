@@ -1,4 +1,4 @@
-"""Adapter for the official WebAgentTextEnv-v0 API; no implicit mocks."""
+"""Adapter for the official WebAgentTextEnv-v0 API."""
 from __future__ import annotations
 from .common import BenchmarkStep, ManifestEnv
 WebShopStep = BenchmarkStep

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Shared encoder per backbone; formal manifests and prepared datasets required.
 set -euo pipefail
 BENCHMARK="${1:-webshop}"
 GPU_IDS="${2:-0,1}"

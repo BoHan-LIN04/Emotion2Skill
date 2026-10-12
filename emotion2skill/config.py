@@ -1,4 +1,4 @@
-"""YAML inheritance, explicit CLI overrides, and validated backbone settings."""
+"""Load inherited YAML configuration and apply CLI overrides."""
 from __future__ import annotations
 import copy
 from pathlib import Path

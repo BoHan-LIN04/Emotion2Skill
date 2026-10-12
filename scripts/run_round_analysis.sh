@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Frozen test curves after each train-only mixed round; no test-feedback updates.
 set -euo pipefail
 export CUDA_VISIBLE_DEVICES="${1:-0,1}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"

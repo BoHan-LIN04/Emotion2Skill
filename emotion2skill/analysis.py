@@ -1,4 +1,4 @@
-"""Analysis of measured episode traces; synthetic runs are never paper evidence."""
+"""Episode metrics, paired comparisons, and activation plots."""
 from __future__ import annotations
 
 import argparse
@@ -32,7 +32,7 @@ def read_episodes(paths, *, phase="evaluation", split="test"):
 
 
 def aggregate_runs(episodes, *, split="test"):
-    """Independent-run summaries (sample standard deviation, ddof=1)."""
+    """Summarize runs using sample standard deviation (ddof=1)."""
     by_run = defaultdict(list)
     seen = set()
     for ep in episodes:
@@ -78,11 +78,7 @@ def aggregate_runs(episodes, *, split="test"):
 
 
 def paired_comparison(baseline, candidate, *, seed=42, resamples=10000):
-    """Task-cluster bootstrap CI and paired sign-flip test across matched runs.
-
-    Repeated runs of a task are first averaged; they are not treated as
-    independent tasks. Test and CI concern this supplied paired task sample.
-    """
+    """Task-paired bootstrap and sign-flip test after averaging repeated runs."""
     if resamples < 100:
         raise ValueError("Use at least 100 resamples")
     def keyed(rows):
@@ -151,7 +147,7 @@ def transition_points(steps):
 
 
 def annotation_summary(judgments, human_annotations):
-    """Compute coherence and Cohen's kappa from supplied event annotations."""
+    """Compute coherence and Cohen's kappa from event annotations."""
     from sklearn.metrics import cohen_kappa_score
     def keyed(rows):
         values = {}
@@ -251,7 +247,7 @@ def plot_generalization(baseline, candidate, out_dir):
 
 
 def plot_layer_probes(probe_files, out_dir):
-    """t-SNE and Fisher diagnostic from exported activations, never synthetic points."""
+    """Plot t-SNE and Fisher diagnostics from activation exports."""
     import matplotlib.pyplot as plt
     from sklearn.manifold import TSNE
     records = []

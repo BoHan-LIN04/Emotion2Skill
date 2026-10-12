@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Refit control encoders with matching features; keep library/data/order fixed.
 set -euo pipefail
 export CUDA_VISIBLE_DEVICES="${1:-0,1}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"

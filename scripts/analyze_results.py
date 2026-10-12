@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze real traces after installing the package with its analysis extra."""
+"""Analyze episode traces and activation exports."""
 from emotion2skill.analysis import main
 
 if __name__ == "__main__":

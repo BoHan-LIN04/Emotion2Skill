@@ -1,37 +1,29 @@
-# Python bytecode
 __pycache__/
 *.py[cod]
 *.pyo
 
-# Distribution / packaging
 *.egg-info/
 dist/
 build/
 *.egg
 
-# Testing
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Checkpoints & logs (generated at runtime)
 checkpoints/
 logs/
 results/
 
-# Data (generated at runtime)
 data/*
 !data/LICENSE
 
-# Environment
 .env
 .venv
 venv/
 
-# macOS
 .DS_Store
 
-# Editor
 .idea/
 .vscode/
 *.swp

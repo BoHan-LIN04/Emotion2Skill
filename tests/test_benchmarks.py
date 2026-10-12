@@ -1,4 +1,3 @@
-"""Small fixtures exercise benchmark boundaries without downloading datasets."""
 import json
 from types import SimpleNamespace
 import pytest

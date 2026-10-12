@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare official GoEmotions train/validation/test data for the 27-way probe.
-
-Use --source_dir for a local official TSV snapshot, or --download to obtain and
-record a fixed google-research commit. Neutral labels are removed; neutral-only
-examples are excluded and counted. Original split IDs are kept separate.
-"""
+"""Convert official GoEmotions splits to the 27-label taxonomy, excluding neutral."""
 from __future__ import annotations
 
 import argparse
@@ -59,7 +54,7 @@ def convert_split(tsv_path, emotion_names, split, revision):
 
 
 def download_snapshot(source_dir, revision):
-    # Resolve moving branch references to a concrete commit before downloading.
+    # Pin branch references before downloading split files.
     if len(revision) != 40 or any(ch not in "0123456789abcdef" for ch in revision.lower()):
         request = Request(f"https://api.github.com/repos/{SOURCE_REPO}/commits/{revision}",
                           headers={"User-Agent": "Emotion2Skill-data-preparation"})

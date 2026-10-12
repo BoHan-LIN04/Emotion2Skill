@@ -1,17 +1,4 @@
-"""
-Skill Libraries
-===============
-Defines the initial skill libraries for all four benchmarks:
-  - WebShop  (8 skills, §A.2)
-  - ALFWorld (6 skills, §A.2)
-  - MATH     (6 skills, §A.2)
-  - MBPP     (5 skills, §A.2)
-
-Each skill has a name, a one-line description, and a full SOP.
-These are hand-authored executable initializations. Their equality to the
-historical manuscript experiment libraries has not been established; load
-archived libraries explicitly when reproducing those results.
-"""
+"""Hand-authored initial SOP libraries for WebShop, ALFWorld, MATH and MBPP."""
 
 from __future__ import annotations
 
@@ -25,10 +12,6 @@ def _copy_library(skills):
     return SkillLibrary([Skill(item.name, item.sop, item.description) for item in skills],
                         metadata=dict(INITIAL_LIBRARY_METADATA))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WebShop — 8 skills
-# ─────────────────────────────────────────────────────────────────────────────
 
 WEBSHOP_SKILLS: list[Skill] = [
 
@@ -163,10 +146,6 @@ def get_webshop_library() -> SkillLibrary:
     return _copy_library(WEBSHOP_SKILLS)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ALFWorld — 6 skills (one per task type)
-# ─────────────────────────────────────────────────────────────────────────────
-
 ALFWORLD_SKILLS: list[Skill] = [
 
     Skill(
@@ -269,10 +248,6 @@ def get_alfworld_library() -> SkillLibrary:
     return _copy_library(ALFWORLD_SKILLS)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MATH — 6 skills
-# ─────────────────────────────────────────────────────────────────────────────
-
 MATH_SKILLS: list[Skill] = [
 
     Skill(
@@ -365,10 +340,6 @@ def get_math_library() -> SkillLibrary:
     return _copy_library(MATH_SKILLS)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MBPP — 5 skills
-# ─────────────────────────────────────────────────────────────────────────────
-
 MBPP_SKILLS: list[Skill] = [
 
     Skill(
@@ -457,10 +428,6 @@ def get_mbpp_library() -> SkillLibrary:
     return _copy_library(MBPP_SKILLS)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Factory
-# ─────────────────────────────────────────────────────────────────────────────
-
 LIBRARY_REGISTRY: dict[str, callable] = {
     "webshop":  get_webshop_library,
     "alfworld": get_alfworld_library,
@@ -470,13 +437,7 @@ LIBRARY_REGISTRY: dict[str, callable] = {
 
 
 def get_library(benchmark: str) -> SkillLibrary:
-    """
-    Convenience factory.
 
-    Parameters
-    ----------
-    benchmark : "webshop" | "alfworld" | "math" | "mbpp"
-    """
     benchmark = benchmark.lower()
     if benchmark not in LIBRARY_REGISTRY:
         raise ValueError(

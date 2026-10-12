@@ -1,8 +1,3 @@
-"""
-Unit tests for Emotion2Skill core components.
-Run: pytest tests/ -v
-"""
-
 import torch
 import pytest
 
@@ -20,10 +15,6 @@ from emotion2skill.evolution import (
 from emotion2skill.selection import Skill, SkillLibrary, SkillSelector
 from emotion2skill.skills import get_library
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Encoder tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestEmotionEncoderMLP:
 
@@ -101,7 +92,6 @@ class TestEmotionEncoder:
 
     def test_confidence_gate(self):
         enc = EmotionEncoder(checkpoint_path=None, tau=0.5, device="cpu")
-        # Force confidence by mocking
         e_t = torch.randn(K)
         summary = enc.encode(e_t)
         assert summary.is_admitted == (summary.confidence >= 0.5)
@@ -113,10 +103,6 @@ class TestEmotionEncoder:
         ps = summary.to_prompt_str()
         assert "confidence" in ps.lower()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Evolution tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_episode(n_steps: int = 6, success: bool = False) -> EpisodeLog:
     ep = EpisodeLog(episode_id="test_ep", success=success, outcome=float(success))
@@ -165,10 +151,6 @@ class TestEvolution:
             assert len(w.shift_mags)   == 3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Skill library tests
-# ─────────────────────────────────────────────────────────────────────────────
-
 class TestSkillLibrary:
 
     def test_webshop_library_count(self):
@@ -210,10 +192,6 @@ class TestSkillLibrary:
             get_library("nonexistent")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Skill selector tests (mock LLM)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class TestSkillSelector:
 
     def _mock_llm(self, system: str, user: str) -> str:
@@ -227,7 +205,6 @@ class TestSkillSelector:
 
     def test_invalid_selection_is_rejected(self):
         lib = get_library("webshop")
-        # LLM returns garbage
         sel = SkillSelector(lambda s, u: "UNKNOWN SKILL XYZ")
         with pytest.raises(ValueError, match="Invalid skill selection"):
             sel.select("test", lib)
@@ -236,7 +213,6 @@ class TestSkillSelector:
         from emotion2skill.encoder import EmotionSummary
         lib = get_library("webshop")
         sel = SkillSelector(self._mock_llm)
-        # emotion with c < τ → not admitted → emotion_used should be False
         summary = EmotionSummary(
             template_idx=0,
             template_text=EMOTION_TEMPLATES[0],

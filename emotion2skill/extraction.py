@@ -1,21 +1,4 @@
-"""
-Emotion Vector Extraction
-=========================
-Implements the contrastive-averaging procedure from §3.2 of the paper.
-
-Pipeline
---------
-1. Generate N=100 short stories per GoEmotions concept (K=27).
-2. Run a forward pass through Qwen3; hook residual-stream activations.
-3. Mean-pool over token positions t >= PREFIX_SKIP.
-4. Subtract global mean to obtain contrastive directions v_k^(ℓ).
-5. PCA-based denoising: project out top components of neutral activations.
-6. Stack into emotion extractor matrix W_e ∈ R^{K×d}.
-7. Select optimal layer L* via GoEmotions classification accuracy.
-
-At inference time, project the "Assistant:" delimiter token activation
-through W_e and l2-normalise to get e_t ∈ R^K.
-"""
+"""Extract GoEmotions directions and project routing-prefix activations."""
 
 from __future__ import annotations
 
@@ -34,7 +17,6 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-# ── GoEmotions taxonomy (27 concepts) ────────────────────────────────────────
 GOEMOTIONS_LABELS = [
     "admiration", "amusement", "anger", "annoyance", "approval",
     "caring", "confusion", "curiosity", "desire", "disappointment",
@@ -43,29 +25,24 @@ GOEMOTIONS_LABELS = [
     "optimism", "pride", "realization", "relief", "remorse",
     "sadness", "surprise",
 ]
-K = len(GOEMOTIONS_LABELS)          # 27
+K = len(GOEMOTIONS_LABELS)
 
-# ── Layer candidate grids ─────────────────────────────────────────────────────
 LAYER_GRID = {
-    "qwen3-8b":  [16, 18, 20, 22, 24, 26, 28],   # 36-layer model; L*=24
-    "qwen3-14b": [18, 20, 22, 24, 26, 28, 30],   # 40-layer model; L*=26
+    "qwen3-8b":  [16, 18, 20, 22, 24, 26, 28],
+    "qwen3-14b": [18, 20, 22, 24, 26, 28, 30],
 }
 OPTIMAL_LAYER = {
     "qwen3-8b":  24,
     "qwen3-14b": 26,
 }
 
-PREFIX_SKIP  = 50   # ignore first 50 token positions when mean-pooling
-N_STORIES    = 100  # stories per emotion concept
-N_NEUTRAL    = 100  # appendix extraction protocol
+PREFIX_SKIP  = 50
+N_STORIES    = 100
+N_NEUTRAL    = 100
 PCA_COMPONENTS = 10
 EXTRACTOR_MODES = {"contrastive", "class_mean", "generic_pca"}
 STORY_FILTER_VERSION = "top3-cosine095-prefix50-v1"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Story-generation prompt
-# ─────────────────────────────────────────────────────────────────────────────
 
 STORY_SYSTEM = (
     "You are a creative writer. Write a short story (3–5 sentences) that "
@@ -83,12 +60,8 @@ NEUTRAL_SYSTEM = (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Activation hooking
-# ─────────────────────────────────────────────────────────────────────────────
-
 class ResidualStreamHook:
-    """Hooks the residual stream output of a specified decoder layer."""
+    """Capture the residual-stream output of one decoder layer."""
 
     def __init__(self, model: AutoModelForCausalLM, layer_idx: int):
         self.layer_idx = layer_idx
@@ -98,33 +71,16 @@ class ResidualStreamHook:
         )
 
     def _capture(self, module, inp, out):
-        # out is (hidden_states, ...) for Qwen3 decoder layers
+        # Decoder output may be a tensor or a tuple beginning with hidden states.
         hidden = out[0] if isinstance(out, tuple) else out
-        self.activation = hidden.detach()   # (1, seq_len, d)
+        self.activation = hidden.detach()
 
     def remove(self):
         self._hook.remove()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core extraction class
-# ─────────────────────────────────────────────────────────────────────────────
-
 class EmotionExtractor:
-    """
-    Extracts emotion directions from a Qwen3 model's residual stream.
-
-    Parameters
-    ----------
-    model_name_or_path : str
-        HuggingFace model id or local path (e.g. "Qwen/Qwen3-8B").
-    model_key : str
-        One of "qwen3-8b" | "qwen3-14b" — used to pick layer grid.
-    device : str
-        "cuda" | "cpu".
-    cache_dir : str | None
-        Where to save/load precomputed directions.
-    """
+    """Build and load emotion projections tied to a Qwen3 backbone."""
 
     def __init__(
         self,
@@ -140,8 +96,7 @@ class EmotionExtractor:
         self.device = device
         self.cache_dir = Path(cache_dir) if cache_dir else None
 
-        # Resolve a moving remote ref once, then use the same immutable commit
-        # for tokenizer and weights. Shared models already carry that commit.
+        # Pin tokenizer and weights to the same immutable model commit.
         if revision is None and not Path(model_name_or_path).is_dir():
             if model is not None:
                 revision = getattr(model.config, "_commit_hash", None)
@@ -151,7 +106,6 @@ class EmotionExtractor:
                 if not revision or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
                     raise ValueError("Could not resolve an immutable remote model commit")
 
-        # Load model in non-thinking mode, float16 for memory efficiency
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(
             model_name_or_path, trust_remote_code=True, revision=revision,
         )
@@ -174,7 +128,6 @@ class EmotionExtractor:
         if revision and re.fullmatch(r"[0-9a-fA-F]{40}", revision) and self.model_revision != revision:
             raise ValueError("Loaded model commit does not match the pinned extractor revision")
 
-        # Will be set after build()
         self.W_e: Optional[torch.Tensor] = None   # (K, d)
         self.L_star: Optional[int] = None
         self._neutral_basis: Optional[torch.Tensor] = None  # (PCA_COMPONENTS, d)
@@ -183,10 +136,9 @@ class EmotionExtractor:
         self.generic_mean: Optional[torch.Tensor] = None
         self.metadata: dict = {}
 
-    # ── private helpers ───────────────────────────────────────────────────────
 
     def _generate_text(self, system: str, user: str, temperature: float = 0.0) -> str:
-        """Generate a single text completion with the model."""
+        """Generate one completion from a system/user chat."""
         messages = [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
@@ -209,30 +161,23 @@ class EmotionExtractor:
 
     @torch.no_grad()
     def _get_layer_activation(self, text: str, layer_idx: int) -> torch.Tensor:
-        """
-        Forward-pass `text` through the model and return the mean-pooled
-        residual-stream activation at `layer_idx` over positions >= PREFIX_SKIP.
-
-        Returns
-        -------
-        torch.Tensor of shape (d,)
-        """
+        """Return a (d,) story activation mean over positions >= PREFIX_SKIP."""
         hook = ResidualStreamHook(self.model, layer_idx)
         try:
             inputs = self.tokenizer(text, return_tensors="pt", add_special_tokens=False).to(self.input_device)
             self.model(**inputs)
-            act = hook.activation.float().squeeze(0)   # (seq_len, d)
+            act = hook.activation.float().squeeze(0)
         finally:
             hook.remove()
         seq_len = act.shape[0]
         if seq_len <= PREFIX_SKIP:
             raise ValueError("Story has no token positions beyond the pooling prefix")
-        pooled = act[PREFIX_SKIP:].mean(dim=0)       # (d,)
+        pooled = act[PREFIX_SKIP:].mean(dim=0)
         return pooled.cpu()
 
     @torch.no_grad()
     def _get_position_activation(self, prompt_text, layer_idx, position=None):
-        """Read a specified position of an already formatted generation prefix."""
+        """Read one token of a formatted generation prefix; default to its final token."""
         hook = ResidualStreamHook(self.model, layer_idx)
         try:
             inputs = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).to(self.input_device)
@@ -262,7 +207,6 @@ class EmotionExtractor:
         return F.normalize(self._get_position_activation(
             story, OPTIMAL_LAYER[self.model_key]), dim=0)
 
-    # ── public API ────────────────────────────────────────────────────────────
 
     def generate_stories(
         self,
@@ -271,19 +215,12 @@ class EmotionExtractor:
         temperature: float = 0.0,
         max_attempts_per_class: int = 5000,
     ) -> dict[str, list[str]]:
-        """
-        Generate or load the Emotion Stories dataset.
-
-        Returns
-        -------
-        dict mapping emotion label -> list of story strings (len = n_stories)
-        """
+        """Generate or load filtered story lists keyed by emotion label."""
         p = Path(stories_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         cached = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
         if self.model_key == "qwen3-14b":
-            # The appendix corpus is generated by 8B and reused by both
-            # backbones. Do not silently regenerate or relabel it with 14B.
+            # Reuse the 8B story corpus for both backbones.
             source_metadata = cached.get("metadata", {})
             source_stories = cached.get("stories", {})
             if (source_metadata.get("model_key") != "qwen3-8b" or
@@ -333,7 +270,7 @@ class EmotionExtractor:
             collected, embeddings, filter_records = [], [], []
             prior_records = {r.get("sha256"): r for r in records.get(emotion, [])}
             for story in stories.get(emotion, []):
-                # Unverified legacy caches are rechecked, never silently certified.
+                # Revalidate legacy caches against the current filters.
                 if re.search(r"\b" + re.escape(emotion) + r"\b", story, flags=re.IGNORECASE):
                     continue
                 story_hash = hashlib.sha256(story.encode()).hexdigest()
@@ -406,14 +343,8 @@ class EmotionExtractor:
         stories: dict[str, list[str]],
         layer_idx: int,
     ) -> torch.Tensor:
-        """
-        Compute plain class means at a single layer, retained for the ablation.
-
-        Returns
-        -------
-        directions : torch.Tensor of shape (K, d)
-        """
-        all_means: list[torch.Tensor] = []   # (K, d) list of per-class means
+        """Return plain per-emotion activation means of shape (K, d)."""
+        all_means: list[torch.Tensor] = []
 
         for emotion in tqdm(GOEMOTIONS_LABELS, desc=f"Layer {layer_idx} directions"):
             if len(stories.get(emotion, [])) != N_STORIES:
@@ -422,7 +353,6 @@ class EmotionExtractor:
             for story in stories[emotion]:
                 act = self._get_layer_activation(story, layer_idx)
                 story_acts.append(act)
-            # within-class mean: (d,)
             class_mean = torch.stack(story_acts).mean(dim=0)
             all_means.append(class_mean)
 
@@ -438,13 +368,7 @@ class EmotionExtractor:
         n_neutral: int = N_NEUTRAL,
         temperature: float = 0.0,
     ) -> torch.Tensor:
-        """
-        Compute PCA basis of emotionally neutral activations.
-
-        Returns
-        -------
-        basis : torch.Tensor of shape (PCA_COMPONENTS, d)
-        """
+        """Return neutral activation PCA rows of shape (PCA_COMPONENTS, d)."""
         neutral_acts: list[torch.Tensor] = []
         for i in tqdm(range(n_neutral * 10), desc="Neutral activation attempts"):
             text = self._generate_text(NEUTRAL_SYSTEM,
@@ -458,14 +382,12 @@ class EmotionExtractor:
         if len(neutral_acts) != n_neutral:
             raise RuntimeError("Could not obtain enough neutral stories beyond the token prefix")
 
-        neutral_matrix = torch.stack(neutral_acts)   # (N_NEUTRAL, d)
-        # Subtract mean
+        neutral_matrix = torch.stack(neutral_acts)
         neutral_matrix -= neutral_matrix.mean(dim=0, keepdim=True)
-        # SVD for PCA
         _, singular_values, Vt = torch.linalg.svd(neutral_matrix, full_matrices=False)
         if (singular_values > 1e-7).sum() < PCA_COMPONENTS:
             raise ValueError("Neutral activations have insufficient rank for top-10 denoising")
-        basis = Vt[:PCA_COMPONENTS]  # (PCA_COMPONENTS, d)
+        basis = Vt[:PCA_COMPONENTS]
         return basis
 
     def denoise_directions(
@@ -473,24 +395,9 @@ class EmotionExtractor:
         directions: torch.Tensor,
         neutral_basis: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Project out the top neutral principal components from emotion directions.
-
-        v̂_k = Π⊥ v_k = v_k - Σ_j (v_k · u_j) u_j
-
-        Parameters
-        ----------
-        directions : (K, d)
-        neutral_basis : (PCA_COMPONENTS, d)  — rows are unit vectors
-
-        Returns
-        -------
-        denoised : (K, d)
-        """
-        # Ensure unit rows in basis
-        basis = F.normalize(neutral_basis, dim=1)   # (PCA_COMPONENTS, d)
-        # Projection: (K, PCA_COMPONENTS) @ (PCA_COMPONENTS, d)
-        projections = (directions @ basis.T) @ basis   # (K, d)
+        """Remove neutral-basis projections from (K, d) directions, normalizing basis rows."""
+        basis = F.normalize(neutral_basis, dim=1)
+        projections = (directions @ basis.T) @ basis
         return directions - projections
 
     def classify_goemotions(
@@ -500,24 +407,8 @@ class EmotionExtractor:
         test_labels: list[list[int]],
         layer_idx: int,
     ) -> float:
-        """
-        Evaluate GoEmotions hit-any accuracy for a given layer.
-
-        A prediction is correct if the highest-similarity direction
-        matches any annotated label (multi-label hit-any criterion).
-
-        Parameters
-        ----------
-        W_e : (K, d) emotion directions at this layer
-        test_texts : list of input texts
-        test_labels : list of lists of correct label indices (multi-label)
-        layer_idx : int
-
-        Returns
-        -------
-        accuracy : float in [0, 1]
-        """
-        W_e_norm = F.normalize(W_e, dim=1)   # (K, d)
+        """Score hit-any accuracy: the top cosine-similarity label must match any gold label."""
+        W_e_norm = F.normalize(W_e, dim=1)
         correct = 0
         if not test_texts or len(test_texts) != len(test_labels):
             raise ValueError("Probe texts/labels must be equally sized and nonempty")
@@ -527,8 +418,8 @@ class EmotionExtractor:
                 {"role": "user", "content": text}], tokenize=False,
                 add_generation_prompt=True, enable_thinking=False)
             act = self._get_position_activation(prompt, layer_idx).to(W_e.device)
-            act_norm = F.normalize(act.unsqueeze(0), dim=1)        # (1, d)
-            sims = (act_norm @ W_e_norm.T).squeeze(0)              # (K,)
+            act_norm = F.normalize(act.unsqueeze(0), dim=1)
+            sims = (act_norm @ W_e_norm.T).squeeze(0)
             pred = sims.argmax().item()
             if pred in gold:
                 correct += 1
@@ -546,8 +437,7 @@ class EmotionExtractor:
             records = data.get("records", [])
         else:
             records = data
-            # Old lists have no source provenance. At least reject obvious test
-            # filenames in the validation slot; new preparation writes metadata.
+            # Legacy lists lack split metadata; reject test-named validation inputs.
             if expected_split == "validation" and "test" in source.stem.lower():
                 raise ValueError("The GoEmotions test split cannot be used for layer selection")
         if not records:
@@ -562,11 +452,9 @@ class EmotionExtractor:
     def build(self, stories_path, goemotions_validation_path=None, save_path=None,
               *, goemotions_test_path=None, validation_path=None, test_path=None,
               mode="contrastive"):
-        """Select L* using validation only; optionally evaluate fixed L* on test.
+        """Select a layer on validation data and optionally evaluate it on held-out test data.
 
-        The test path is a separate post-selection evaluation input. A cached
-        extractor keeps both denoised contrastive directions and plain means,
-        so the class-mean control uses exactly the same stories and layer.
+        Contrastive and class-mean matrices share the stories and selected layer.
         """
         validation_path = validation_path or goemotions_validation_path
         test_path = test_path or goemotions_test_path
@@ -631,7 +519,7 @@ class EmotionExtractor:
 
     @torch.no_grad()
     def fit_generic_pca(self, prompt_texts, layer_idx=None, *, split="train"):
-        """Fit PCA-27 on training routing-prefix activations, never test episodes."""
+        """Fit PCA-27 on training routing-prefix activations at the selected layer."""
         if split != "train":
             raise ValueError("Generic PCA may only be fitted on training activations")
         layer_idx = self.L_star if layer_idx is None else layer_idx
@@ -657,12 +545,7 @@ class EmotionExtractor:
 
     @torch.no_grad()
     def export_probe_activations(self, probe_path, output_path, *, split="validation", layer_idx=None):
-        """Export actual fixed-layer activations for reproducible probe analyses.
-
-        This does not create a figure or substitute paper values. The archive
-        contains hidden activations, emotion projections, multi-hot labels,
-        original example IDs, and the exact split/layer/source provenance.
-        """
+        """Export fixed-layer activations, optional emotion projections, labels, IDs, and provenance."""
         if split not in {"validation", "test"}:
             raise ValueError("Probe exports must specify validation or test")
         layer_idx = self.L_star if layer_idx is None else layer_idx
@@ -734,11 +617,10 @@ class EmotionExtractor:
 
     @torch.no_grad()
     def get_emotion_state(self, prompt_text, assistant_token=None, *, position=None):
-        """Project an actual routing chat-prefix activation at an explicit index.
+        """Project a routing-prefix token to a normalized (K,) emotion vector.
 
-        With no position, use the final token of the supplied generation prefix.
-        ``assistant_token`` is a compatibility option: if explicitly requested,
-        absence is an error rather than an observation-tail fallback.
+        The default is the final generation-prefix token. An explicit
+        assistant_token must be present and agree with any supplied position.
         """
         if self.W_e is None or self.L_star is None:
             raise ValueError("Extractor is not built")

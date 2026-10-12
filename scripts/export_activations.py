@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export actual held-out activations for the layer/t-SNE/Fisher analysis."""
+"""Export held-out activations for layer and representation analysis."""
 import argparse
 from emotion2skill.config import resolve_config
 from emotion2skill.extraction import EmotionExtractor

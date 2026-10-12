@@ -1,8 +1,4 @@
-"""Fixed-manifest MBPP pass@1 in a fresh, time/resource-limited process.
-
-Process isolation is not an OS security sandbox. Run real generated-code
-benchmarks in a dedicated container/VM without credentials or mounted secrets.
-"""
+"""MBPP grading uses process timeouts and optional resource limits, not OS sandboxing."""
 from __future__ import annotations
 import json
 import math

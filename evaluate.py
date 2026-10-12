@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate declared methods on fixed manifests, with train-only evolution.
-
-Each run records its effective config, task order, provenance and full episode
-logs. Synthetic smoke-test results are never aggregated into paper metrics.
-"""
+"""Evaluate methods on fixed task manifests with training-only skill evolution."""
 from __future__ import annotations
 import argparse
 import copy
@@ -84,7 +80,7 @@ def task_order(env, n_episodes, seed, order_file=None, reserved=0, excluded_task
         return order
     if n_episodes > len(candidates) or n_episodes < 1:
         raise ValueError(f"Requested {n_episodes} tasks but {len(candidates)} eligible {env.split} tasks exist")
-    # Fix the subset across runs; vary ordering only, matching the stated protocol.
+    # Runs share the task subset and vary its order.
     order = candidates[:n_episodes]
     random.Random(seed).shuffle(order)
     return order
@@ -96,7 +92,7 @@ def _protocol_manifest(config, benchmark):
     return load_manifest(path, benchmark)
 
 def _validate_train_task_ids(task_ids, manifest, *, source):
-    """Bind source IDs to an explicit benchmark namespace and original split."""
+    """Validate benchmark-prefixed IDs against the training split."""
     benchmark = manifest["benchmark"]
     if (not isinstance(task_ids, list) or not task_ids or
             any(not isinstance(item, str) or not item for item in task_ids) or
@@ -116,7 +112,7 @@ def _validate_train_task_ids(task_ids, manifest, *, source):
     return ids
 
 def validate_protocol_provenance(config):
-    """Close the checkpoint/data lineage before any backbone is constructed."""
+    """Validate checkpoint task IDs and manifest hashes before model loading."""
     evaluation = config["evaluation"]
     if evaluation["mock"]:
         return {"synthetic": True, "warmup_task_ids": {}, "manifests": {}}
@@ -196,7 +192,7 @@ def _hash_file(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest() if path and Path(path).is_file() else None
 
 class SyntheticLLM:
-    """Deterministic local plumbing probe; never an actual model prediction."""
+    """Deterministic responses for mock evaluation."""
     def __init__(self, benchmark): self.benchmark = benchmark
     def chat_prefix(self, system, user): return system + "\n" + user
     def __call__(self, system, user):
@@ -263,8 +259,7 @@ def _environment(config, name, split):
         extra["data_path"] = settings["data_path"]
     if name == "mbpp":
         extra["timeout"] = evaluation.get("mbpp_timeout", 5.0)
-    # An override applies to the target benchmark; the other evolution domain
-    # retains its own action budget (15 WebShop, 50 ALFWorld).
+    # max_steps overrides only the selected benchmark.
     max_steps = evaluation.get("max_steps") if name == evaluation["env"] else None
     return build_env(name, manifest, split, mock=evaluation["mock"], max_steps=max_steps, **extra)
 
@@ -326,9 +321,7 @@ def run_evaluation(config, output, verbose=False):
                          for name in ("webshop", "alfworld")}
             training_envs = {name: _environment(config, name, "train") for name in libraries}
             count = evolution_config["rounds"] * evolution_config["episode_per_round"]
-            # Learned inference is bound to the exact checkpoint source IDs.
-            # Synthetic and top-3/no-encoder plumbing reserves the same nominal
-            # warm-up subset conservatively, without claiming it was trained.
+            # Without encoder source IDs, reserve the configured warm-up subset.
             reserved = config["training"]["warmup_episodes_per_env"] if not provenance["warmup_task_ids"] else 0
             for name, training in training_envs.items():
                 order_file = evaluation.get("evolution_task_order")
@@ -341,8 +334,6 @@ def run_evaluation(config, output, verbose=False):
             batch = evolution_config["episode_per_round"]
             for round_index in range(evolution_config["rounds"]):
                 for name, training in training_envs.items():
-                    # Keep the domain-specific step budget while sharing model,
-                    # extractor and trained encoder across both skill libraries.
                     if hasattr(agent, "config"):
                         agent.config.max_steps = training.max_steps
                     if isinstance(getattr(agent, "llm", None), SyntheticLLM):
@@ -384,7 +375,6 @@ def run_evaluation(config, output, verbose=False):
                 "encoder": _hash_file(config["encoder"].get("checkpoint")),
                 "baseline_artifact": _hash_file(evaluation.get("baseline_artifact"))}}
         (run_dir / "evaluation_metadata.json").write_text(json.dumps(metadata, indent=2))
-        # Complete per-task grading evidence even for external runners.
         with (run_dir / "episodes.jsonl").open("w") as handle:
             for log in logs:
                 handle.write(json.dumps(log.to_dict(), ensure_ascii=False) + "\n")

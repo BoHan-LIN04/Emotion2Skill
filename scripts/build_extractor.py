@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline build with validation-only layer selection and separate held-out test."""
+"""Build an extractor with validation-based layer selection and held-out testing."""
 import argparse
 import sys
 from pathlib import Path

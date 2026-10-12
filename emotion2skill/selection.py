@@ -1,18 +1,4 @@
-"""
-Emotion-Augmented Skill Selection  (§3.3)
-==========================================
-
-Implements Eqs. (9)–(11) of the paper:
-
-  P_t = [x_t; {D_i}; T_t*; c_t]  if c_t >= τ
-        [x_t; {D_i}]              otherwise
-
-  s_t* = argmax_{s_i ∈ S}  p_M(s_i | P_t)
-
-The LLM receives the augmented prompt and selects a skill by constrained
-generation over valid skill identifiers.  Setting τ=1 recovers the
-standard text-only selection baseline (MASA-style).
-"""
+"""Confidence-gated emotion context and skill selection."""
 
 from __future__ import annotations
 
@@ -24,21 +10,9 @@ if TYPE_CHECKING:
     from .encoder import EmotionSummary
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Skill data structure
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class Skill:
-    """
-    A single skill in the library S.
 
-    Attributes
-    ----------
-    name        : short identifier used in prompt (e.g. "ProductSearch")
-    sop         : full natural-language Standard Operating Procedure D_i
-    description : one-line summary for the selection menu
-    """
     name:        str
     sop:         str
     description: str
@@ -46,13 +20,10 @@ class Skill:
 
 @dataclass
 class SkillLibrary:
-    """
-    The skill library S = {s_1, ..., s_M}.
-    """
+
     skills: list[Skill] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
 
-    # ── accessors ─────────────────────────────────────────────────────────────
 
     def __len__(self) -> int:
         return len(self.skills)
@@ -73,17 +44,16 @@ class SkillLibrary:
                 return
         raise KeyError(f"Skill '{name}' not found.")
 
-    # ── prompt formatting ─────────────────────────────────────────────────────
 
     def format_menu(self) -> str:
-        """Format the skill selection menu (name + one-line description)."""
+
         lines = ["Available skills:"]
         for i, s in enumerate(self.skills, 1):
             lines.append(f"  {i}. {s.name}: {s.description}")
         return "\n".join(lines)
 
     def format_sops(self, names: Optional[list[str]] = None) -> str:
-        """Format the full SOPs for the listed skills (or all)."""
+
         targets = names if names is not None else self.names()
         parts = []
         for name in targets:
@@ -91,10 +61,6 @@ class SkillLibrary:
             parts.append(f"=== Skill: {s.name} ===\n{s.sop}")
         return "\n\n".join(parts)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt builder
-# ─────────────────────────────────────────────────────────────────────────────
 
 SELECTION_SYSTEM = """\
 You are an autonomous agent equipped with a skill library. \
@@ -130,19 +96,7 @@ def build_selection_prompt(
     library:        SkillLibrary,
     emotion:        Optional[EmotionSummary],
 ) -> str:
-    """
-    Constructs P_t (Eq. 9) for the skill-selection call.
-
-    Parameters
-    ----------
-    context  : x_t — concatenated task instruction + history + observation
-    library  : S
-    emotion  : φ_t from the encoder; if None or not admitted, omitted
-
-    Returns
-    -------
-    Full prompt string passed to the LLM.
-    """
+    """Build a routing prompt with admitted emotion context."""
     emotion_block = ""
     if emotion is not None and emotion.is_admitted:
         emotion_block = EMOTION_BLOCK_TEMPLATE.format(
@@ -158,10 +112,6 @@ def build_selection_prompt(
     return user_msg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Skill selector
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class SelectionResult:
     skill_name:    str
@@ -172,19 +122,7 @@ class SelectionResult:
 
 
 class SkillSelector:
-    """
-    Emotion-Augmented Skill Selection (Eq. 9–11).
-
-    Scores every valid identifier by its conditional token log probability.
-    Text-only mock callables must return one exact identifier or menu number;
-    ambiguous output is rejected instead of silently selecting the first skill.
-
-    Parameters
-    ----------
-    llm_callable : callable(system: str, user: str) -> str
-        Any function that accepts system + user strings and returns
-        the LLM's text completion.  Wired to the Qwen3 wrapper in agent.py.
-    """
+    """Score valid identifiers, or parse an exact name/menu number from a text-only callable."""
 
     def __init__(self, llm_callable):
         self._llm = llm_callable
@@ -195,13 +133,7 @@ class SkillSelector:
         library:  SkillLibrary,
         emotion:  Optional[EmotionSummary] = None,
     ) -> SelectionResult:
-        """
-        Perform one skill-selection step.
 
-        Returns
-        -------
-        SelectionResult with the chosen skill name and metadata.
-        """
         prompt = build_selection_prompt(context, library, emotion)
         names = library.names()
         if not names:
@@ -231,11 +163,7 @@ class SkillSelector:
 
     @staticmethod
     def _parse_skill(text: str, library: SkillLibrary) -> str:
-        """
-        Extract the skill name from model output.
-        Accept an entire exact skill name (case-insensitive) or a 1-based
-        menu number. Never interpret a mention in explanatory prose as a vote.
-        """
+        """Accept an exact skill name (case-insensitive) or a 1-based menu number."""
         names = library.names()
 
         answer = text.strip().strip('"\'').strip()

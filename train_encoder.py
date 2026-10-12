@@ -1,10 +1,4 @@
-"""Collect train-only warm-up traces and train an auditable emotion encoder.
-
-Default protocol: 250 WebShop + 250 ALFWorld baseline episodes, real internal
-states recorded without routing augmentation, AdamW, and held-out episode early
-stopping. The confidence head uses episode-success BCE with weight 1 by default.
-No experiment outcomes or checkpoints are synthesized by this script.
-"""
+"""Collect train-split warm-up states and train the emotion encoder."""
 from __future__ import annotations
 
 import argparse
@@ -32,10 +26,9 @@ def collect_warmup_data(agent, env, library, n_episodes=250, verbose=False,
                         format_context_fn=None, *, namespace="warmup",
                         skill_offset=0, min_signal=0.05, return_metadata=False,
                         episode_order=None):
-    """Record emotion states under the text-only policy, never inject them.
+    """Collect emotion states without prompt injection and filter low-signal steps.
 
-    Low-signal steps are removed. ``return_metadata`` retains episode groups and
-    the actual extraction chat prefixes, needed for a train-only PCA control.
+    return_metadata includes episode groups and extraction prefixes for PCA fitting.
     """
     if n_episodes <= 0:
         raise ValueError("Warm-up episode count must be positive")
@@ -109,12 +102,11 @@ def train_encoder(e_vectors, skill_labels, success_flags, out_path, *, epochs=50
                   device="cuda", seed=42, group_ids=None, validation_fraction=0.2,
                   semantic_vectors=None, extractor_mode="contrastive",
                   shuffle_context=False, source_metadata=None):
-    """Train all heads and save their semantic mapping and effective protocol.
+    """Train encoder heads and save the semantic mapping and training metadata.
 
-    ``semantic_vectors`` are aligned GoEmotions vectors used to interpret
-    clusters when the input features are generic PCA coordinates. Shuffling
-    permutes skill/outcome context tuples *within the training partition* while
-    keeping the input vectors and their template semantics unchanged.
+    Aligned semantic_vectors interpret clusters formed from generic-PCA features.
+    shuffle_context permutes skill/outcome tuples only within the training partition,
+    keeping input vectors and template semantics fixed.
     """
     if epochs < 1 or batch_size < 1 or patience < 1 or confidence_weight <= 0:
         raise ValueError("Positive epochs, batch size, patience and BCE weight are required")
@@ -372,7 +364,6 @@ def main():
                        "warmup_policy": "ReAct with shared skill library; confidence/emotion withheld; collect_emotion=True",
                        "environment_split": "train",
                        "effective_config": args.effective_config}
-    # Exact input tuples are local research evidence, not fabricated benchmark results.
     tuples_path = Path(args.out).with_name(Path(args.out).stem + "_warmup.pt")
     tuples_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"features": features, "semantic_vectors": semantic_vectors,

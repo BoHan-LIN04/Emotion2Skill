@@ -1,4 +1,3 @@
-"""CPU regressions for training/probe contracts; no models or downloads."""
 import importlib.util
 import json
 from pathlib import Path
@@ -128,8 +127,7 @@ def test_shuffled_control_preserves_feature_semantics_and_records_permutation(tm
     assert permutation != sorted(permutation)
     assert metadata["shuffle_context"] is True
     assert metadata["template_bank"] == EMOTION_TEMPLATES
-    # The semantic mapping is fit to the original feature vectors, not shuffled
-    # skills. Reordering cluster IDs still retains their natural-language meaning.
+    # Context shuffling must preserve the centroids' emotion semantics.
     mapping, _ = cluster_template_mapping(torch.tensor(metadata["semantic_centroids"]))
     assert mapping.tolist() == metadata["cluster_to_template"]
 

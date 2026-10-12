@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Create manifests from local benchmark records; never download or invent data.
+"""Create split manifests from local benchmark records.
 
 WebShop input: JSON with explicit train/dev/test lists of canonical goal indices.
-MATH/MBPP input: JSON mapping train/dev/test to original task records; task_id
-must be present (or canonical id/task_id supplied by the dataset).
-ALFWorld input: downloaded ALFWORLD_DATA root; uses official train/valid_seen/
-valid_unseen game files, preserving their original paths.
+MATH/MBPP input: train/dev/test records with task_id or id.
+ALFWorld input: a data root containing json_2.1.1 game files.
 """
 from __future__ import annotations
 import argparse

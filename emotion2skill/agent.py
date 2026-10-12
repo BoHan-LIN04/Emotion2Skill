@@ -1,4 +1,4 @@
-"""Online routing, execution and complete, non-overwriting run evidence."""
+"""LLM routing, action execution and run logging."""
 from __future__ import annotations
 
 import dataclasses
@@ -18,7 +18,7 @@ from .selection import SELECTION_SYSTEM, SkillLibrary, SkillSelector, build_sele
 
 
 def validate_inference_assets(config, require_encoder: bool = True) -> dict:
-    """Check local feature/encoder artifacts before downloading backbone weights."""
+    """Validate checkpoints before loading the backbone."""
     import pickle
     import numpy as np
     if not config.extractor_path or not Path(config.extractor_path).is_file():
@@ -65,7 +65,7 @@ def validate_inference_assets(config, require_encoder: bool = True) -> dict:
         config.model_revision = revision
     if require_encoder and config.encoder_mode == "learned":
         from .encoder import EmotionEncoder
-        # A tiny CPU encoder validates state shapes and provenance without any backbone.
+
         encoder = EmotionEncoder(config.encoder_path, tau=config.tau, device="cpu", require_trained=True,
             expected_extractor_mode=config.extractor_mode,
             expected_shuffle_context=config.shuffle_context)
@@ -81,7 +81,7 @@ def validate_inference_assets(config, require_encoder: bool = True) -> dict:
 
 
 class Qwen3LLM:
-    """One shared backbone with greedy generation and exact candidate scoring."""
+    """Shared Qwen3 inference and candidate scoring."""
     def __init__(self, model_name_or_path: str, device: str = "cuda", max_new_tokens: int = 512,
                  max_context_tokens: Optional[int] = None, revision: Optional[str] = None):
         import torch
@@ -128,7 +128,7 @@ class Qwen3LLM:
         return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
 
     def score_candidates(self, system: str, user: str, candidates: list[str]) -> dict[str, float]:
-        """Return log p(identifier | complete chat generation prefix), without length normalization."""
+        """Sum identifier token log probabilities without length normalization."""
         import torch
         prefix = self._inputs(self.chat_prefix(system, user))["input_ids"]
         prefix_length = prefix.shape[1]
@@ -217,8 +217,8 @@ class Emotion2SkillAgent:
     def __init__(self, config: AgentConfig, llm=None, validate_extractor: bool = True):
         self.config = config
         if llm is None and config.extractor_path and validate_extractor:
-            # The initial validation sets the checkpoint-pinned revision before
-            # any expensive remote model/tokenizer load; encoder checks are repeated by load().
+            # Pin the checkpoint revision before loading model weights.
+
             validate_inference_assets(config, require_encoder=False)
         self.llm = llm if llm is not None else Qwen3LLM(
             config.model_name_or_path, config.device, max_context_tokens=config.max_context_tokens,
@@ -458,6 +458,6 @@ class Emotion2SkillAgent:
             stream.write(json.dumps(log.to_dict(), ensure_ascii=False, allow_nan=False) + "\n")
 
     def _save_logs(self, logs: list[EpisodeLog]) -> None:
-        """Compatibility helper; normal execution persists each episode immediately."""
+
         for log in logs:
             self._append_log(log)

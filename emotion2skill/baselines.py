@@ -1,11 +1,4 @@
-"""Explicit baseline protocols and checked adapters for upstream skill methods.
-
-Built-ins are manuscript-protocol adaptations, not upstream paper result replicas.
-Primary sources: ReAct arXiv:2210.03629; Reflexion arXiv:2303.11366;
-ExpeL arXiv:2308.10144 and https://github.com/LeapLabTHU/ExpeL.
-MASA/AlignEvoSkill/Trace2Skill require a source-pinned external implementation;
-a lexical skill router is exposed as TextSimilarity and is never called MASA.
-"""
+"""Baseline runners and source-pinned upstream adapters."""
 from __future__ import annotations
 
 import hashlib
@@ -35,7 +28,7 @@ PRIMARY_SOURCES = {
 
 
 class BM25:
-    """Okapi BM25 with fixed k1=1.5, b=.75 and positive Robertson IDF."""
+    """Okapi BM25 with positive Robertson IDF."""
     def __init__(self, documents: list[str], k1: float = 1.5, b: float = .75):
         if not documents:
             raise ValueError("BM25 requires a nonempty corpus.")
@@ -70,14 +63,13 @@ class BM25:
 
 
 def parse_react_action(output: str) -> tuple[str, str]:
-    """Accept a single explicit Action field; retain Thought verbatim for evidence."""
+    """Parse one Action field and return it with the preceding Thought text."""
     lines = output.splitlines()
     action_lines = [(index, line.partition(":")[2].strip()) for index, line in enumerate(lines)
                     if re.match(r"^\s*Action\s*:", line, flags=re.IGNORECASE)]
     if len(action_lines) != 1 or not action_lines[0][1]:
         raise ValueError("ReAct must output exactly one nonempty 'Action:' line.")
     index, action = action_lines[0]
-    # Multiline final answers/code use a fenced block after 'Action:' instead.
     if action == "```" or action.startswith("```python"):
         tail = "\n".join(lines[index + 1:])
         if not tail.rstrip().endswith("```"):
@@ -96,12 +88,7 @@ def _experience_text(record: dict) -> str:
 
 
 def build_expel_memory(llm, episodes: list[EpisodeLog], out_path, allow_mock: bool = False) -> dict:
-    """Extract evolving insights from actual, disjoint training trajectories.
-
-    The retrieval policy uses BM25/top-5 as specified by this manuscript;
-    upstream ExpeL uses richer extraction/retrieval options. No outcomes or
-    insights are synthesized without recorded episodes and real LLM output.
-    """
+    """Build ExpeL insights and retrieval memory from training episodes."""
     if not episodes or any(episode.split != "train" for episode in episodes):
         raise ValueError("ExpeL memory can be built only from explicitly identified training episodes.")
     synthetic = any(episode.backend in {"mock", "synthetic"} for episode in episodes)
@@ -111,8 +98,6 @@ def build_expel_memory(llm, episodes: list[EpisodeLog], out_path, allow_mock: bo
         raise ValueError("The manuscript ExpeL protocol requires 50 distinct training tasks.")
     insights, extraction_records = "", []
     records = [episode.to_dict() for episode in episodes]
-    # Successful/failed experiences in each block are contrasted, with existing
-    # insights revised after every block rather than a retrieval-only alias.
     for start in range(0, len(records), 8):
         block = records[start:start + 8]
         prompt = ("Compare these recorded successful and failed training experiences. "
@@ -197,7 +182,7 @@ class BaselineAgent(Emotion2SkillAgent):
                 "fidelity": artifact.get("fidelity"), "source_task_ids": [item["task_id"] for item in experiences]})
 
     def load(self, *args, **kwargs):
-        """Baselines use the shared LLM; no emotion extractor or encoder is loaded."""
+        """The shared LLM is supplied at construction."""
         return None
 
     def _step(self, t, observation, context, library, history, use_emotion=False, collect_emotion=None):
@@ -215,7 +200,6 @@ class BaselineAgent(Emotion2SkillAgent):
                                           context=context, action_instruction=self._action_instruction)
             prompt, raw = self.executor.last_prompt, self.executor.last_raw_output
         elif self.method_name == "ZeroShot":
-            # No chain-of-thought request, candidate skills, SOPs, or retrieval.
             prompt = f"{context}\n\nEnvironment action syntax:\n{self._action_instruction}\n\nNext action:"
             raw = self.llm(ACTION_SYSTEM, prompt).strip()
             action = raw
@@ -283,7 +267,7 @@ class BaselineAgent(Emotion2SkillAgent):
 
 
 class CheckedExternalAgent:
-    """Require upstream adapters to preserve split boundaries and evidence schema."""
+    """Validate upstream runner splits and episode-log schema."""
     def __init__(self, runner, manifest):
         self.runner, self.manifest = runner, manifest
         self.config = runner.config
@@ -379,7 +363,6 @@ def build_baseline(method: str, config: AgentConfig, llm=None, artifact_path=Non
     if method not in PRIMARY_SOURCES:
         raise ValueError(f"Unknown baseline {method}; choices: {list(PRIMARY_SOURCES)}")
     if method in {"MASA", "EvoSkill", "Trace2Skill"}:
-        # Validate before loading an expensive backbone when the adapter is absent.
         if not external_adapter or not artifact_path:
             return _load_external(method, config, llm, artifact_path, external_adapter)
         return _load_external(method, config, llm, artifact_path, external_adapter)
@@ -387,7 +370,7 @@ def build_baseline(method: str, config: AgentConfig, llm=None, artifact_path=Non
 
 
 def load_episode_logs(path) -> list[EpisodeLog]:
-    """Load the complete shared JSONL schema for offline experience learning."""
+    """Load episode JSONL records for offline experience learning."""
     episodes = []
     episode_fields = {item.name for item in dataclasses.fields(EpisodeLog)}
     step_fields = {item.name for item in dataclasses.fields(StepRecord)}

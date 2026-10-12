@@ -7,5 +7,4 @@ for METHOD in ZeroShot ReAct Reflexion TextSimilarity; do
   "${PYTHON_BIN}" evaluate.py --config "${CONFIG}" --env "${BENCHMARK}" --method "${METHOD}" \
     --n_runs 3 --out_dir "results/baselines/${BENCHMARK}/${METHOD}"
 done
-# ExpeL requires --baseline_artifact from actual training episodes.
-# MASA/EvoSkill/Trace2Skill require both a real artifact and --external_adapter module:factory.
+# ExpeL needs --baseline_artifact; upstream skill methods also need --external_adapter.

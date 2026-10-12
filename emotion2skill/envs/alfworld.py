@@ -1,4 +1,3 @@
-"""ALFWorld adapter with task manifests and complete upstream config."""
 from __future__ import annotations
 import copy
 import hashlib

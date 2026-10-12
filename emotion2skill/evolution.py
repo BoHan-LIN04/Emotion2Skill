@@ -1,4 +1,4 @@
-"""Emotion transition diagnostics, LLM verbalization, and auditable SOP evolution."""
+"""Emotion transition diagnostics and SOP rewriting."""
 from __future__ import annotations
 
 import dataclasses
@@ -85,7 +85,7 @@ class EpisodeLog:
         result = _serializable(self)
         result["n_steps"] = len(self.steps)
         result["synthetic"] = self.backend.casefold() in {"mock", "synthetic"}
-        # Stable aliases used by analysis consumers and legacy result readers.
+
         for step in result["steps"]:
             step["skill"] = step["skill_selected"]
             step["action"] = step["action_taken"]
@@ -110,7 +110,7 @@ def compute_shift_magnitudes(episode: EpisodeLog) -> list[float]:
 
 
 def find_transition_points(episode: EpisodeLog, deltas: list[float]) -> list[int]:
-    """Return zero-based step indices; delta[i] arrives at step i+1."""
+    """Return zero-based steps; delta[i] corresponds to step i + 1."""
     if len(deltas) < 2:
         return []
     threshold = statistics.mean(deltas) + statistics.pstdev(deltas)
@@ -236,12 +236,7 @@ class SkillPerformanceTracker:
 
 
 class DiagnosticBudget:
-    """Hierarchical LLM reduction with exact tokenizer counts and source lineage.
-
-    Every source character enters a recorded fragment call; no source windows
-    are sampled away. Summaries are model interpretations, so both the complete
-    originals and each reduction input/output remain in the round evidence.
-    """
+    """Reduce diagnostics within tokenizer budgets; retain every source span and reduction lineage."""
     def __init__(self, llm, records):
         self.llm, self.records = llm, records
         limit = getattr(llm, "max_context_tokens", None)
@@ -291,8 +286,8 @@ class DiagnosticBudget:
         prompt = prompt_fn(self.render(pieces))
         if self.fits(VERBALIZATION_SYSTEM, prompt):
             return self.call(VERBALIZATION_SYSTEM, prompt, "all_windows", pieces)
-        # Split an oversized window into consecutively numbered, reversible
-        # character ranges. Binary search uses the actual chat tokenizer.
+        # Split oversized windows into reversible ranges using actual chat-token counts.
+
         fragments = []
         for piece in pieces:
             if self.fits(VERBALIZATION_SYSTEM, prompt_fn(self.render([piece]))):
@@ -315,8 +310,8 @@ class DiagnosticBudget:
                     raise ValueError("The SOP and verbalization instructions leave no room for a diagnostic fragment.")
                 fragment = {"id": identifier, "text": piece["text"][cursor:cursor + fitted],
                             "sources": piece["sources"], "character_range": [cursor, cursor + fitted]}
-                # Each fragment is immediately summarized; exact ranges allow
-                # reconstructing even context strings that cross a boundary.
+
+
                 fragments.append(self.call(VERBALIZATION_SYSTEM, prompt_fn(self.render([fragment])),
                                            "window_fragment", [fragment]))
                 cursor += fitted
@@ -431,7 +426,7 @@ class SkillEvolutionEngine:
             raw = self._llm(EVOLUTION_SYSTEM, prompt).strip()
             rewrite_attempts = [{"prompt": prompt, "output": raw}]
             entry["rewrite_attempts"] = rewrite_attempts
-            # One explicit correction request; never silently clip procedural text.
+            # Request one length correction while preserving procedural steps.
             if len(raw.split()) > 200:
                 correction_prompt = ("Compress this SOP to at most 200 words while preserving its "
                                      "conditions and steps. Output only the SOP:\n" + raw)

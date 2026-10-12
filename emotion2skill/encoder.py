@@ -1,29 +1,4 @@
-"""
-Emotion Encoder  f_θ
-=====================
-Implements §3.2 (Emotion encoder) of the paper.
-
-Architecture
-------------
-Input : e_t ∈ R^K  (K=27, ℓ2-normalised emotion state)
-Hidden: 3-layer MLP  K → 64 → 128 → d' (d'=128), ReLU activations
-Output:
-  r_t ∈ R^{d'} — encoded representation
-  T_t* ∈ {T_1,...,T_C} — template index via cosine similarity (C=12)
-  c_t ∈ (0,1) — confidence scalar via sigmoid head
-
-Training objective (Eq. 6–8)
-------------------------------
-L = L_ctr + λ * L_cls
-
-L_ctr : supervised-contrastive loss (Khosla et al., 2020)
-        positives = same effective skill AND successful episode
-L_cls : cross-entropy over template prototype similarities
-        pseudo-labels from k-means (k=C) on raw emotion vectors
-
-The MLP backbone has 26,624 parameters; including prototypes and the
-confidence head the encoder has 28,289 trainable parameters.
-"""
+"""Encode normalized emotion vectors into template choices and confidence."""
 
 from __future__ import annotations
 
@@ -39,15 +14,10 @@ import torch.nn.functional as F
 
 from .extraction import K, GOEMOTIONS_LABELS
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-C  = 12    # number of emotion-state template slots
-D_PRIME = 128   # encoder output dim
+C  = 12
+D_PRIME = 128
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 12 natural-language emotion-state templates
-# (designed to span the GoEmotions valence/arousal space)
-# ─────────────────────────────────────────────────────────────────────────────
 TEMPLATE_BANK_VERSION = "appendix-12-v1"
 EMOTION_TEMPLATES: list[str] = [
     "The agent is curious; it is actively seeking new information.",
@@ -64,8 +34,7 @@ EMOTION_TEMPLATES: list[str] = [
     "The agent's internal state is neutral; no strong affective signal is present.",
 ]
 
-# The association is explicit and stored in checkpoints. Cluster numbers have
-# no inherent meaning: centroid-to-profile assignment establishes the mapping.
+# Cluster IDs have no inherent template semantics; persist their assignment.
 TEMPLATE_EMOTION_WEIGHTS: list[dict[str, float]] = [
     {"curiosity": 1.0}, {"desire": 1.0}, {"confusion": 1.0},
     {"approval": 1.0}, {"optimism": 1.0}, {"pride": 1.0},
@@ -77,18 +46,8 @@ TEMPLATE_EMOTION_WEIGHTS: list[dict[str, float]] = [
 assert len(EMOTION_TEMPLATES) == C
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MLP Encoder
-# ─────────────────────────────────────────────────────────────────────────────
-
 class EmotionEncoderMLP(nn.Module):
-    """
-    3-layer MLP:  K → 64 → 128 → d'
-
-    Also holds:
-    - C learnable prototype vectors q_j ∈ R^{d'} (Eq. 4)
-    - a linear confidence head w_c, b_c (Eq. 5)
-    """
+    """Normalized embeddings with learnable template prototypes and a sigmoid confidence head."""
 
     def __init__(self, k: int = K, d_prime: int = D_PRIME, n_templates: int = C):
         super().__init__()
@@ -96,7 +55,6 @@ class EmotionEncoderMLP(nn.Module):
         self.d_prime    = d_prime
         self.n_templates = n_templates
 
-        # MLP backbone
         self.mlp = nn.Sequential(
             nn.Linear(k, 64),
             nn.ReLU(),
@@ -105,58 +63,27 @@ class EmotionEncoderMLP(nn.Module):
             nn.Linear(128, d_prime),
         )
 
-        # Template prototypes q_j ∈ R^{d'}  (Eq. 4)
         self.prototypes = nn.Parameter(torch.randn(n_templates, d_prime))
         nn.init.xavier_uniform_(self.prototypes.unsqueeze(0)).squeeze(0)
 
-        # Confidence head  (Eq. 5)
         self.w_c = nn.Linear(d_prime, 1, bias=True)
 
     def forward(self, e: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        e : (B, K) ℓ2-normalised emotion state vectors
-
-        Returns
-        -------
-        r : (B, d') encoded representations (ℓ2-normalised)
-        c : (B,)   confidence scores in (0, 1)
-        """
-        r_raw = self.mlp(e)                         # (B, d')
-        r     = F.normalize(r_raw, dim=-1)          # (B, d')
-        c     = torch.sigmoid(self.w_c(r)).squeeze(-1)  # (B,)
+        """Map (B, K) states to normalized (B, d') representations and (B,) confidence scores."""
+        r_raw = self.mlp(e)
+        r     = F.normalize(r_raw, dim=-1)
+        c     = torch.sigmoid(self.w_c(r)).squeeze(-1)
         return r, c
 
     def template_scores(self, r: torch.Tensor) -> torch.Tensor:
-        """
-        Cosine similarities between r and all prototype vectors.
-
-        Returns
-        -------
-        scores : (B, C)
-        """
-        proto_norm = F.normalize(self.prototypes, dim=-1)   # (C, d')
-        return r @ proto_norm.T                              # (B, C)
+        """Return (B, C) cosine scores for normalized representations and prototypes."""
+        proto_norm = F.normalize(self.prototypes, dim=-1)
+        return r @ proto_norm.T
 
     def select_template(self, r: torch.Tensor) -> torch.Tensor:
-        """
-        Eq. (4): T_t* = argmax_j  r_t · q_j / (‖r_t‖ ‖q_j‖)
+        """Return one zero-based template index per representation."""
+        return self.template_scores(r).argmax(dim=-1)
 
-        Parameters
-        ----------
-        r : (B, d')
-
-        Returns
-        -------
-        indices : (B,) LongTensor
-        """
-        return self.template_scores(r).argmax(dim=-1)   # (B,)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Loss functions
-# ─────────────────────────────────────────────────────────────────────────────
 
 def supervised_contrastive_loss(
     r: torch.Tensor,
@@ -164,56 +91,35 @@ def supervised_contrastive_loss(
     success_flags: torch.Tensor,
     temperature: float = 0.07,
 ) -> torch.Tensor:
-    """
-    Eq. (6): L_ctr — supervised contrastive loss.
+    """Contrast normalized (B, d') representations using same-skill successful positives.
 
-    Positive examples j have the same skill label and y_j=1. Failed anchors
-    can still be compared to successful examples of the same skill. Self pairs
-    are excluded; anchors without a positive do not enter the average.
-
-    Parameters
-    ----------
-    r             : (B, d') ℓ2-normalised representations
-    skill_labels  : (B,) LongTensor — skill index s_t^sel
-    success_flags : (B,) BoolTensor — y_t ∈ {0,1}
-    temperature   : κ in the paper
-
-    Returns
-    -------
-    loss : scalar
+    Positive eligibility depends on y_j, not the anchor outcome y_i.
+    Self pairs and anchors without positives are excluded from the mean.
     """
     B = r.shape[0]
     device = r.device
 
-    # Pairwise cosine similarities (r is already ℓ2-normalised)
-    sim = (r @ r.T) / temperature   # (B, B)
+    sim = (r @ r.T) / temperature
 
-    # Mask out self
     self_mask = torch.eye(B, dtype=torch.bool, device=device)
     sim = sim.masked_fill(self_mask, float("-inf"))
 
-    # Match the paper's A+(i): a successful positive j, regardless of y_i.
-    sk_match = skill_labels.unsqueeze(1) == skill_labels.unsqueeze(0)  # (B, B)
+    sk_match = skill_labels.unsqueeze(1) == skill_labels.unsqueeze(0)
     pos_mask = sk_match & success_flags.unsqueeze(0) & ~self_mask
 
-    n_pos = pos_mask.sum(dim=1).clamp(min=1)  # (B,)
+    n_pos = pos_mask.sum(dim=1).clamp(min=1)
 
-    # Guard: rows where all non-self entries are -inf produce NaN in log_softmax.
-    # Replace such rows with zeros before the softmax so they evaluate to a
-    # uniform distribution; they will be excluded from the mean anyway.
-    all_masked = sim.isinf() & (sim < 0)   # True where entries are -inf
-    rows_all_inf = all_masked.all(dim=1, keepdim=True)   # (B, 1)
+    # All-masked rows would yield NaN in log_softmax; they do not enter the mean.
+    all_masked = sim.isinf() & (sim < 0)
+    rows_all_inf = all_masked.all(dim=1, keepdim=True)
     sim_safe = sim.masked_fill(rows_all_inf, 0.0)
 
-    log_probs = F.log_softmax(sim_safe, dim=1)     # (B, B)
+    log_probs = F.log_softmax(sim_safe, dim=1)
 
-    # IEEE 754: -inf * 0 = NaN.  The diagonal has log_prob=-inf and pos_mask=0,
-    # so we must zero those out explicitly before summing.
-    # Use torch.where to avoid the multiply-then-NaN path entirely.
+    # Mask before reduction: multiplying masked -inf values by zero yields NaN.
     pos_log = torch.where(pos_mask, log_probs, torch.zeros_like(log_probs))
     loss_per_anchor = -pos_log.sum(dim=1) / n_pos
 
-    # Only average over anchors that have at least one positive
     has_pos = pos_mask.any(dim=1)
     if has_pos.sum() == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
@@ -226,28 +132,11 @@ def template_classification_loss(
     prototypes: torch.Tensor,
     temperature: float = 0.1,
 ) -> torch.Tensor:
-    """
-    Eq. (7): L_cls — cross-entropy over prototype cosine similarities.
-
-    Parameters
-    ----------
-    r             : (B, d') ℓ2-normalised representations
-    pseudo_labels : (B,) LongTensor — k-means cluster assignments
-    prototypes    : (C, d') learnable prototype matrix
-    temperature   : κ' in the paper
-
-    Returns
-    -------
-    loss : scalar
-    """
+    """Cross-entropy over normalized (B, d') representations and prototype cosine scores."""
     proto_norm = F.normalize(prototypes, dim=-1)
-    logits = (r @ proto_norm.T) / temperature   # (B, C)
+    logits = (r @ proto_norm.T) / temperature
     return F.cross_entropy(logits, pseudo_labels)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# k-means pseudo-label generation
-# ─────────────────────────────────────────────────────────────────────────────
 
 def kmeans_pseudo_labels(
     e_vectors: torch.Tensor,
@@ -256,18 +145,7 @@ def kmeans_pseudo_labels(
     seed: int = 42,
     return_centroids: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """
-    Simple Lloyd's k-means on emotion vectors to generate pseudo-labels.
-
-    Parameters
-    ----------
-    e_vectors  : (N, K) raw emotion vectors
-    n_clusters : k = C = 12
-
-    Returns
-    -------
-    labels : (N,) LongTensor
-    """
+    """Cluster (N, K) features with Lloyd k-means; optionally return centroids with labels."""
     if e_vectors.ndim != 2 or not torch.isfinite(e_vectors).all():
         raise ValueError("k-means expects a finite (N, K) feature matrix")
     N, D = e_vectors.shape
@@ -276,7 +154,7 @@ def kmeans_pseudo_labels(
     if torch.unique(e_vectors, dim=0).shape[0] < n_clusters:
         raise ValueError("Too few distinct feature vectors for the template clusters")
     generator = torch.Generator(device=e_vectors.device).manual_seed(seed)
-    # k-means++ prevents duplicate centroid initialisation.
+    # k-means++ avoids duplicate initial centroids.
     first = torch.randint(N, (1,), generator=generator, device=e_vectors.device)
     idx_list = [int(first.item())]
     for _ in range(1, n_clusters):
@@ -284,14 +162,12 @@ def kmeans_pseudo_labels(
         next_idx = torch.multinomial(distances, 1, generator=generator).item()
         idx_list.append(int(next_idx))
     idx = torch.tensor(idx_list, device=e_vectors.device)
-    centroids = e_vectors[idx].clone()   # (C, D)
+    centroids = e_vectors[idx].clone()
 
     labels = torch.zeros(N, dtype=torch.long, device=e_vectors.device)
     for _ in range(n_iters):
-        # Assign
-        dists  = torch.cdist(e_vectors, centroids)   # (N, C)
-        labels = dists.argmin(dim=1)                  # (N,)
-        # Update
+        dists  = torch.cdist(e_vectors, centroids)
+        labels = dists.argmin(dim=1)
         new_centroids = torch.zeros_like(centroids)
         for c in range(n_clusters):
             mask = labels == c
@@ -310,12 +186,10 @@ def kmeans_pseudo_labels(
 def cluster_template_mapping(
     semantic_centroids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Match clusters to the appendix bank by GoEmotions semantic profiles.
+    """Assign clusters to templates using GoEmotions centroid profiles.
 
-    For a generic-PCA control, these centroids must be computed from the
-    corresponding *emotion* states, not from arbitrary principal components.
-    The neutral profile prefers the least concentrated absolute activation.
-    This is an auditable semantic heuristic, not an annotated ground truth.
+    Generic-PCA clusters require centroids from aligned emotion states.
+    The neutral profile favors the smallest maximum absolute activation.
     """
     from scipy.optimize import linear_sum_assignment
 
@@ -338,23 +212,9 @@ def cluster_template_mapping(
     return mapping, scores
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Encoded emotion summary (used at inference time)
-# ─────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class EmotionSummary:
-    """
-    φ_t = (T_t*, c_t)
-
-    Attributes
-    ----------
-    template_idx  : int — index into EMOTION_TEMPLATES (0-based)
-    template_text : str — the natural-language template string
-    confidence    : float — scalar in (0, 1)
-    emotion_state : torch.Tensor of shape (K,) — raw e_t for logging
-    is_admitted   : bool — True if c_t >= τ (injected into prompt)
-    """
+    """Zero-based template choice, confidence, admission flag, and logged (K,) emotion vector."""
     template_idx:  int
     template_text: str
     confidence:    float
@@ -362,27 +222,15 @@ class EmotionSummary:
     is_admitted:   bool
 
     def to_prompt_str(self) -> str:
-        """Human-readable string for prompt injection (when admitted)."""
+        """Format the summary for prompt insertion; the caller checks admission."""
         return (
             f"[Emotion State] {self.template_text} "
             f"(confidence: {self.confidence:.2f})"
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# High-level encoder wrapper (used by the agent at inference)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class EmotionEncoder:
-    """
-    Wraps EmotionEncoderMLP for inference use.
-
-    Parameters
-    ----------
-    checkpoint_path : str — path to saved encoder state dict
-    tau             : float — confidence gate threshold (default 0.3)
-    device          : str
-    """
+    """Validate checkpoint metadata and encode emotion states for confidence-gated routing."""
 
     def __init__(
         self,
@@ -413,24 +261,13 @@ class EmotionEncoder:
 
     @torch.no_grad()
     def encode(self, e_t: torch.Tensor) -> EmotionSummary:
-        """
-        Produce the emotion summary φ_t = (T_t*, c_t) from a raw emotion
-        state vector e_t ∈ R^K.
-
-        Parameters
-        ----------
-        e_t : (K,) ℓ2-normalised emotion state (output of EmotionExtractor)
-
-        Returns
-        -------
-        EmotionSummary
-        """
+        """Map a finite, normalized (K,) emotion vector to a template and confidence summary."""
         if e_t.shape != (K,) or not torch.isfinite(e_t).all():
             raise ValueError(f"Expected a finite emotion vector of shape ({K},)")
-        e = e_t.float().unsqueeze(0).to(self.device)   # (1, K)
-        r, c = self.model(e)                            # (1, d'), (1,)
-        tidx  = self.model.select_template(r).item()   # int
-        conf  = c.item()                                # float
+        e = e_t.float().unsqueeze(0).to(self.device)
+        r, c = self.model(e)
+        tidx  = self.model.select_template(r).item()
+        conf  = c.item()
 
         return EmotionSummary(
             template_idx  = tidx,
