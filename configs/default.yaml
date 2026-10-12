@@ -1,0 +1,47 @@
+# Default Emotion2Skill configuration (Qwen3-8B, WebShop)
+# Override individual fields via CLI flags or a custom YAML.
+
+model:
+  name_or_path: "Qwen/Qwen3-8B"
+  key: "qwen3-8b"          # qwen3-8b | qwen3-14b
+  device: "cuda"
+
+extractor:
+  optimal_layer:            # null = auto-selected via GoEmotions sweep
+  stories_path: "data/emotion_stories/stories.json"
+  goemotions_test: "data/goemotions/test.json"
+  n_stories: 100
+  prefix_skip: 50
+  pca_components: 5
+  n_neutral: 200
+
+encoder:
+  d_prime: 128              # MLP output dim
+  n_templates: 12           # C = 12 emotion-state templates
+  tau: 0.3                  # confidence gate threshold
+  kappa: 0.07               # contrastive temperature
+  kappa_prime: 0.10         # classification temperature
+  lambda: 0.5               # weight of L_cls
+
+training:
+  warmup_episodes: 50
+  epochs: 30
+  batch_size: 256
+  lr: 3.0e-4
+  seed: 42
+
+evolution:
+  enabled: true
+  rounds: 5
+  eta: 0.5                  # skill underperformance threshold
+  window: 20                # rolling window for success tracking
+  episode_per_round: 20
+
+evaluation:
+  n_episodes: 500           # WebShop test set size
+  n_runs: 3
+  max_steps: 15             # per episode (WebShop)
+
+logging:
+  log_dir: "logs"
+  results_dir: "results"
